@@ -4,7 +4,7 @@ set -e
 cd "$(dirname "$0")"
 
 VER=$(sed -n 's/^version=//p' module.prop)
-OUT="../acc_keeper-${VER}.zip"
+OUT=${1:-"../acc_keeper-${VER}.zip"}
 
 rm -f "$OUT"
 zip -r -X "$OUT" \

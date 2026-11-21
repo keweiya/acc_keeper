@@ -1,0 +1,74 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（留空则用 module.prop 里的版本号）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 读取模块版本
+        id: meta
+        run: |
+          VERSION=$(sed -n 's/^version=//p' module.prop)
+          CODE=$(sed -n 's/^versionCode=//p' module.prop)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "版本: $VERSION ($CODE)"
+
+      - name: 安装 zip 工具
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zip
+
+      - name: 打包模块
+        id: build
+        run: |
+          chmod +x build.sh
+          OUT="${RUNNER_TEMP}/acc_keeper-${{ steps.meta.outputs.version }}.zip"
+          ./build.sh "$OUT"
+          echo "zip=$OUT" >> "$GITHUB_OUTPUT"
+          ls -lh "$OUT"
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: 无障碍守护 ${{ steps.meta.outputs.version }}
+          files: ${{ steps.build.outputs.zip }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body: |
+            ## 无障碍守护 ${{ steps.meta.outputs.version }}
+
+            KernelSU 模块：开机自动启用并**持续守护**指定应用的无障碍服务。被系统、安全中心或省电策略关掉后自动恢复，并记录每次变化。
+
+            ### 安装
+            1. 下载下面的 `acc_keeper-${{ steps.meta.outputs.version }}.zip`
+            2. KernelSU 管理器 → 模块 → 从本地安装
+            3. 重启设备
+            4. 打开模块的 WebUI，挑要守护的应用
+
+            ### 命令行安装（Termux）
+            ```sh
+            su -c "/data/adb/ksu/bin/ksud module install /sdcard/Download/acc_keeper-${{ steps.meta.outputs.version }}.zip"
+            ```
+
+            ### 热更新（已装过的情况）
+            ```sh
+            su -c acc_ctl upgrade /sdcard/Download/acc_keeper-${{ steps.meta.outputs.version }}.zip
+            ```
+
+            完整说明见 [README](https://github.com/${{ github.repository }}#readme)。
