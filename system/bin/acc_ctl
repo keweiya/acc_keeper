@@ -1,0 +1,9 @@
+#!/system/bin/sh
+# 模块入口：转发到模块目录里的真实脚本（兼容升级后 modules_update 状态）
+for d in /data/adb/modules/acc_keeper /data/adb/modules_update/acc_keeper; do
+  if [ -f "$d/bin/acc_ctl" ]; then
+    exec sh "$d/bin/acc_ctl" "$@"
+  fi
+done
+echo "acc_keeper 模块未安装或已被停用" >&2
+exit 1

@@ -1,0 +1,6 @@
+id=acc_keeper
+name=无障碍守护
+version=v1.20.0
+versionCode=22000
+author=keweiya
+description=○ 尚未启动｜安装后重启生效｜在 WebUI 里选择要守护的应用

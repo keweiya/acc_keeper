@@ -1,0 +1,1128 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="light dark" />
+<title>无障碍守护</title>
+<script>
+(function(){
+  try{
+    var pref = localStorage.getItem("acc_keeper_theme") || "auto";
+    var dark = pref === "dark" ||
+      (pref === "auto" && window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches);
+    document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+  }catch(e){ document.documentElement.setAttribute("data-theme", "light"); }
+})();
+</script>
+<style>
+:root{
+  color-scheme:light;
+  --bg:#f6f6f7;--surface:#fff;--surface-2:#f2f2f7;--surface-pressed:#e9e9ef;
+  --text:#171717;--muted:#77777d;--secondary:#8e8e93;--accent:#2e75f4;
+  --danger:#ff3b30;--warn:#ff9500;--ok:#34c759;--switch-off:#d1d1d6;--divider:#e5e5ea;
+  --shadow-soft:0 6px 18px #00000014;--shadow-button:0 4px 12px #0000001f;
+  --shadow-icon:0 3px 8px #0000002e;--shadow-card:0 8px 24px #00000012;--shadow-card-soft:0 3px 10px #0000000b;
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#0f1014;--surface:#1c1d22;--surface-2:#26272c;--surface-pressed:#32333a;
+  --text:#f5f5f7;--muted:#a1a1aa;--secondary:#8e8e93;--switch-off:#3a3a40;--divider:#34343a;
+  --shadow-soft:0 10px 28px #0000005c;--shadow-button:0 6px 18px #00000052;
+  --shadow-icon:0 4px 12px #0000006b;--shadow-card:0 12px 30px #0000004d;--shadow-card-soft:0 5px 14px #0000003d;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%}
+body{color:var(--text);background:var(--bg);user-select:none;margin:0;
+  font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Noto Sans SC",sans-serif;}
+.page{max-width:600px;margin:0 auto;padding:16px 20px 120px;animation:.36s cubic-bezier(.2,.8,.2,1) both page-enter}
+@keyframes page-enter{0%{opacity:0;transform:translateY(10px) scale(.995)}to{opacity:1;transform:translateY(0) scale(1)}}
+
+/* ---------- 顶部：标题 + 状态 + 更多 ---------- */
+.app-header{margin-bottom:18px}
+.header-top{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.header-title h1{letter-spacing:-.5px;margin:0;font-size:26px;font-weight:800}
+.more-button{width:38px;height:38px;flex:none;border:0;border-radius:999px;background:var(--surface);
+  box-shadow:var(--shadow-button);color:var(--text);display:grid;place-items:center;transition:transform .15s,background .15s}
+.more-button:active{transform:scale(.94);background:var(--surface-pressed)}
+.more-button svg{width:20px;height:20px;fill:currentColor}
+
+.state-bar{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;color:var(--muted);flex-wrap:wrap}
+.state-dot{width:8px;height:8px;border-radius:50%;background:var(--secondary);flex:none;transition:background .2s}
+.state-dot.is-ok{background:var(--ok);box-shadow:0 0 0 3px rgba(52,199,89,.16)}
+.state-dot.is-warn{background:var(--warn);box-shadow:0 0 0 3px rgba(255,149,0,.16)}
+.state-name{color:var(--text);font-weight:600}
+.state-sep{color:var(--divider)}
+
+/* ---------- 搜索 ---------- */
+.search-card{background:var(--surface);box-shadow:var(--shadow-card-soft);border-radius:20px;
+  margin-bottom:18px;padding:14px 18px;display:flex;align-items:center;gap:10px}
+.search-card svg{width:17px;height:17px;fill:var(--secondary);flex:none}
+.search-input{flex:1;min-width:0;color:var(--text);background:0 0;border:0;outline:none;font-size:16px}
+.search-input::placeholder{color:var(--muted)}
+
+/* ---------- 列表 ---------- */
+.status-line{color:var(--muted);text-align:center;margin-bottom:14px;font-size:12.5px}
+.status-line.idle{display:none}
+.spin{width:14px;height:14px;border:2px solid var(--divider);border-top-color:var(--accent);border-radius:50%;display:inline-block;animation:spin .8s linear infinite;vertical-align:-2px;margin-right:7px}
+.ptr.on .ptr-spinner{animation:.8s linear infinite spin}
+html.locked,body.locked{overflow:hidden!important;height:100%}
+.notice{background:var(--surface);box-shadow:var(--shadow-card-soft);border-radius:16px;padding:12px 16px;
+  font-size:13px;color:var(--muted);margin-bottom:14px;line-height:1.5}
+.notice.is-warn{color:var(--warn)}
+.hidden{display:none!important}
+.empty-state{background:var(--surface);color:var(--muted);text-align:center;box-shadow:var(--shadow-card-soft);
+  border-radius:20px;margin:8px 0 16px;padding:24px 20px;font-size:14px;line-height:1.6}
+.app-list{opacity:0;flex-direction:column;gap:12px;transition:opacity .26s,transform .36s cubic-bezier(.2,.8,.2,1);display:flex;transform:translateY(12px)}
+.app-list.is-ready{opacity:1;transform:translateY(0)}
+.app-card{background:var(--surface);box-shadow:var(--shadow-card-soft);cursor:pointer;border-radius:22px;
+  align-items:center;gap:14px;padding:14px 16px;display:flex;
+  transition:opacity .3s cubic-bezier(.2,.8,.2,1),transform .3s cubic-bezier(.2,.8,.2,1),background .16s;
+  transition-delay:var(--enter-delay,0s)}
+.app-card:active{background:var(--surface-pressed)}
+.app-card.enter{opacity:0;transform:translateY(-10px) scale(.98)}
+.icon-wrap{background:var(--surface-2);border-radius:12px;flex-shrink:0;width:46px;height:46px;position:relative;overflow:hidden}
+.icon-loader{background:linear-gradient(90deg,var(--surface-2) 0%,var(--surface-pressed) 45%,var(--surface-2) 100%);
+  z-index:2;background-size:200% 100%;animation:1.2s ease-in-out infinite skeleton-shimmer;position:absolute;inset:0}
+@keyframes skeleton-shimmer{0%{background-position:100% 0}to{background-position:-100% 0}}
+.icon-fallback{color:var(--secondary);background:var(--surface-2);opacity:0;visibility:hidden;z-index:1;
+  place-items:center;font-size:18px;font-weight:700;transition:opacity .2s,visibility .2s;display:grid;position:absolute;inset:0}
+.icon-fallback.visible{opacity:1;visibility:visible}
+.app-icon{object-fit:cover;opacity:0;z-index:3;width:100%;height:100%;transition:opacity .3s;position:absolute;inset:0}
+.app-icon.is-loaded{opacity:1}
+.app-icon.is-error{opacity:0!important}
+.app-info{flex:1;min-width:0}
+.app-name{white-space:nowrap;text-overflow:ellipsis;font-size:15.5px;font-weight:600;overflow:hidden;margin-bottom:2px}
+.package-name{color:var(--secondary);white-space:nowrap;text-overflow:ellipsis;margin-bottom:3px;font-size:12px;overflow:hidden}
+.app-status{color:var(--muted);font-size:12px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.app-status.is-live{color:var(--accent)}
+.app-status.is-wait{color:var(--warn)}
+
+/* ---------- 开关 ---------- */
+.switch{background:var(--switch-off);width:52px;height:32px;box-shadow:inset 0 0 0 1px var(--divider),var(--shadow-button);
+  cursor:pointer;border:0;border-radius:999px;flex-shrink:0;padding:2px;transition:background .3s cubic-bezier(.4,0,.2,1),transform .2s;position:relative}
+.switch:active{transform:scale(.97)}
+.switch:active .switch-thumb{width:34px}
+.switch.is-on:active .switch-thumb{transform:translate(14px)}
+.switch.is-on{background:var(--accent)}
+.switch.is-disabled{opacity:.32;pointer-events:none}
+/* 忙：缩略图隐藏，中间转圈（不提前翻状态） */
+.switch.is-busy{pointer-events:none;background:var(--surface-2);box-shadow:inset 0 0 0 1px var(--divider)}
+.switch.is-busy .switch-thumb{opacity:0;transform:scale(.4)}
+.switch::after{content:"";position:absolute;left:50%;top:50%;width:16px;height:16px;margin:-10px 0 0 -10px;
+  border:2px solid rgba(46,117,244,.22);border-top-color:var(--accent);border-radius:50%;opacity:0;
+  transition:opacity .15s;pointer-events:none}
+.switch.is-busy::after{opacity:1;animation:spin .7s linear infinite}
+/* 成功：轻轻弹一下 */
+.switch.is-pop{animation:ok-pop .42s cubic-bezier(.2,.8,.2,1)}
+@keyframes ok-pop{0%{transform:scale(.92)}55%{transform:scale(1.06)}100%{transform:scale(1)}}
+/* 失败：抖一下 */
+.switch.is-fail{animation:shake .42s cubic-bezier(.36,.07,.19,.97)}
+@keyframes shake{0%,100%{transform:translateX(0)}18%{transform:translateX(-4px)}38%{transform:translateX(4px)}58%{transform:translateX(-3px)}78%{transform:translateX(2px)}}
+.switch-thumb{background:#fff;border-radius:50%;width:28px;height:28px;
+  transition:transform .3s cubic-bezier(.4,0,.2,1),width .3s cubic-bezier(.4,0,.2,1),opacity .18s;display:block;
+  box-shadow:0 3px 8px #00000026,0 1px 1px #00000029,0 3px 1px #0000001a}
+.switch.is-on .switch-thumb{transform:translate(20px)}
+
+/* ---------- 立即检查 ---------- */
+.fab{position:fixed;right:18px;bottom:calc(18px + env(safe-area-inset-bottom));z-index:20;
+  height:48px;padding:0 18px 0 14px;border-radius:999px;border:0;background:var(--surface);color:var(--text);
+  box-shadow:var(--shadow-card);display:flex;align-items:center;gap:8px;font-size:14px;font-weight:600;
+  transition:transform .18s cubic-bezier(.2,.8,.2,1),color .18s}
+.fab:active{transform:scale(.95)}
+.fab svg{width:19px;height:19px;fill:currentColor}
+.fab.is-busy{color:var(--accent);pointer-events:none}
+.fab.is-busy svg{animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ---------- 下拉刷新 ---------- */
+.ptr{opacity:0;pointer-events:none;justify-content:center;align-items:center;height:0;display:flex;overflow:hidden;
+  transition:height .2s cubic-bezier(.2,.8,.2,1),opacity .2s}
+.ptr.on{opacity:1}
+.ptr-spinner{border:2px solid var(--accent);opacity:.92;border-top-color:#0000;border-radius:50%;width:22px;height:22px}
+.ptr-spinner.active{animation:.8s linear infinite spin}
+.sheet-inner,.sheet-body{overscroll-behavior:contain}
+
+/* ---------- 底部面板 ---------- */
+.sheet{position:fixed;inset:0;background:#0006;display:flex;align-items:flex-end;z-index:60;backdrop-filter:blur(2px)}
+.sheet-inner{width:100%;max-height:88%;background:var(--bg);border-radius:20px 20px 0 0;display:flex;flex-direction:column;
+  box-shadow:var(--shadow-card);animation:sheet-in .3s cubic-bezier(.2,.8,.2,1)}
+@keyframes sheet-in{0%{transform:translateY(24px);opacity:.4}to{transform:translateY(0);opacity:1}}
+.sheet-grab{width:36px;height:5px;border-radius:999px;background:var(--divider);margin:8px auto 0;flex:none}
+.sheet-head{display:flex;align-items:center;padding:10px 20px 12px;font-weight:700;font-size:17px}
+.sheet-head button{margin-left:auto;background:none;border:0;color:var(--accent);font-size:15px;font-weight:600;padding:4px}
+.sheet-body{padding:0 16px calc(14px + env(safe-area-inset-bottom));overflow:auto}
+
+.group{margin-top:10px}
+.group-title{font-size:12px;color:var(--muted);padding:0 14px 7px;font-weight:600;letter-spacing:.2px}
+.group-card{background:var(--surface);border-radius:16px;overflow:hidden;box-shadow:var(--shadow-card-soft)}
+.row{display:flex;align-items:center;gap:12px;padding:12px 16px;font-size:15px;background:transparent;
+  border:0;width:100%;text-align:left;color:var(--text);font-family:inherit;cursor:pointer}
+.row+.row{border-top:1px solid var(--divider)}
+.row:active{background:var(--surface-2)}
+.row .grow{flex:1;min-width:0}
+.row .value{color:var(--muted);font-size:13px;white-space:nowrap}
+.chev{color:var(--secondary);font-size:19px;line-height:1;margin-top:-2px}
+
+/* 小号开关 */
+.tgl{position:relative;width:46px;height:28px;flex:none;border-radius:999px;background:var(--switch-off);
+  box-shadow:inset 0 0 0 1px var(--divider);transition:background .25s}
+.tgl::after{content:"";position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:#fff;
+  box-shadow:0 2px 5px #0003;transition:transform .25s cubic-bezier(.4,0,.2,1)}
+.tgl.on{background:var(--accent)}
+.tgl.on::after{transform:translateX(18px)}
+
+/* 分段控件 */
+.seg{display:flex;background:var(--surface-2);border-radius:11px;padding:3px;gap:2px;width:100%}
+.seg button{flex:1;height:30px;border:0;border-radius:8px;background:transparent;color:var(--muted);
+  font-size:13px;font-weight:600;font-family:inherit;cursor:pointer}
+.seg button.on{background:var(--surface);color:var(--text);box-shadow:0 2px 6px #0000001f}
+
+/* 表单 */
+.form{padding:4px 16px calc(24px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:14px}
+.field{display:flex;align-items:center;gap:12px;font-size:15px}
+.field span{flex:1}
+.field input{width:92px;height:38px;border-radius:10px;border:1px solid var(--divider);
+  background:var(--surface);color:var(--text);text-align:center;font-size:15px;outline:none}
+.field input:focus{border-color:var(--accent)}
+.hint{font-size:12px;color:var(--muted);line-height:1.6}
+.save{height:44px;border-radius:12px;border:0;background:var(--accent);color:#fff;font-size:15px;font-weight:600;font-family:inherit}
+.save:active{transform:scale(.98)}
+.form-msg{font-size:12px;color:var(--muted);min-height:16px;line-height:1.5}
+.form-msg.is-ok{color:var(--ok)}
+.form-msg.is-warn{color:var(--warn)}
+
+.sheet pre{margin:0;padding:4px 20px calc(24px + env(safe-area-inset-bottom));overflow:auto;
+  font:12px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div class="page">
+  <header class="app-header">
+    <div class="header-top">
+      <div class="header-title"><h1>无障碍守护</h1></div>
+      <button class="more-button js-more" aria-label="设置与操作">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
+      </button>
+    </div>
+    <div class="state-bar">
+      <span class="state-dot js-dot"></span>
+      <span class="state-name js-state">正在读取…</span>
+      <span class="state-sep">·</span>
+      <span class="js-meta"></span>
+    </div>
+  </header>
+
+  <section class="search-card">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 4a6 6 0 1 0 3.71 10.71l4.3 4.3a1 1 0 0 0 1.41-1.41l-4.3-4.3A6 6 0 0 0 10 4Zm0 2a4 4 0 1 1 0 8 4 4 0 0 1 0-8Z"/></svg>
+    <input class="search-input js-search" type="search" placeholder="搜索应用或包名" enterkeyhint="search" autocomplete="off">
+  </section>
+
+  <div class="notice hidden js-notice"></div>
+  <div class="ptr js-ptr"><div class="ptr-spinner js-ptr-spinner"></div></div>
+  <div class="status-line js-status idle"><span class="spin js-spin hidden"></span><span class="js-status-text"></span></div>
+  <section class="empty-state js-empty hidden">暂无应用</section>
+  <section class="app-list js-list"></section>
+</div>
+
+<button class="fab js-fix" aria-label="立即检查">
+  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 4 5.5v6c0 5 3.4 9.3 8 10.5 4.6-1.2 8-5.5 8-10.5v-6L12 2Zm-1.2 13.6-3.3-3.3 1.4-1.4 1.9 1.9 4.5-4.5 1.4 1.4-5.9 5.9Z"/></svg>
+  <span>立即检查</span>
+</button>
+
+<!-- 设置与操作 -->
+<div class="sheet hidden js-menu-sheet">
+  <div class="sheet-inner"><div class="sheet-grab"></div>
+    <div class="sheet-head"><span>设置与操作</span><button class="js-menu-close">关闭</button></div>
+    <div class="sheet-body">
+      <div class="group">
+        <div class="group-title">显示</div>
+        <div class="group-card">
+          <button class="row js-only-guarded"><span class="grow">仅看已守护</span><span class="tgl js-tgl-guarded"></span></button>
+          <button class="row js-show-all"><span class="grow">显示全部应用</span><span class="tgl js-tgl-all"></span></button>
+        </div>
+      </div>
+      <div class="group">
+        <div class="group-title">巡检</div>
+        <div class="group-card">
+          <button class="row js-menu-interval"><span class="grow">轮询间隔</span><span class="value js-interval-val">—</span><span class="chev">›</span></button>
+        </div>
+      </div>
+      <div class="group">
+        <div class="group-title">操作</div>
+        <div class="group-card">
+          <button class="row js-menu-pause"><span class="grow js-pause-label">暂停守护 30 分钟</span><span class="chev">›</span></button>
+          <button class="row js-menu-log"><span class="grow">查看日志</span><span class="chev">›</span></button>
+        </div>
+      </div>
+      <div class="group">
+        <div class="group-title">外观</div>
+        <div class="group-card">
+          <div class="row" style="padding:12px 14px">
+            <div class="seg js-seg">
+              <button data-t="auto">跟随系统</button>
+              <button data-t="light">浅色</button>
+              <button data-t="dark">深色</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="group">
+        <div class="group-card">
+          <button class="row js-menu-about"><span class="grow">关于</span><span class="value js-ver"></span><span class="chev">›</span></button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 轮询间隔 -->
+<div class="sheet hidden js-interval-sheet">
+  <div class="sheet-inner"><div class="sheet-grab"></div>
+    <div class="sheet-head"><span>轮询间隔</span><button class="js-interval-close">关闭</button></div>
+    <div class="form">
+      <label class="field"><span>快速轮询<br><small style="color:var(--secondary);font-size:12px">开机前 3 分钟 / 修复后</small></span><input type="number" inputmode="numeric" min="1" max="3600" class="js-in-fast"></label>
+      <label class="field"><span>稳定轮询<br><small style="color:var(--secondary);font-size:12px">平时多久查一次</small></span><input type="number" inputmode="numeric" min="1" max="3600" class="js-in-slow"></label>
+      <div class="hint">单位：秒。稳定轮询 60 秒 ≈ 一天 1440 次检查，耗电可忽略；改小恢复更快，但唤醒次数按比例增加。</div>
+      <button class="save js-interval-save">保存并重启守护</button>
+      <div class="form-msg js-interval-msg"></div>
+    </div>
+  </div>
+</div>
+
+<!-- 日志 / 关于 -->
+<div class="sheet hidden js-sheet">
+  <div class="sheet-inner"><div class="sheet-grab"></div>
+    <div class="sheet-head"><span class="js-sheet-title">最近日志</span><button class="js-sheet-close">关闭</button></div>
+    <pre class="js-sheet-body">加载中…</pre>
+  </div>
+</div>
+<script>
+(function(){
+"use strict";
+var ACC = "/data/adb/modules/acc_keeper/bin/acc_ctl";
+var ACC_ALT = "/data/adb/modules_update/acc_keeper/bin/acc_ctl";
+function $(s, r){ return (r || document).querySelector(s); }
+
+/* ---------------- KernelSU WebUI 桥 ----------------
+   KernelSU / KernelSU Next 的签名是 ksu.exec(cmd, optionsJson, callbackFuncName)，
+   第三个参数是注册在 window 上的函数名字符串，不是一个函数对象。 */
+var cbSeq = 0;
+function ksuExec(cmd, opts){
+  return new Promise(function(resolve){
+    if(typeof ksu === "undefined" || !ksu || typeof ksu.exec !== "function"){
+      resolve({errno:-99, stdout:"", stderr:"NO_BRIDGE"}); return;
+    }
+    var name = "__acc_cb_" + Date.now() + "_" + (cbSeq++);
+    var done = false;
+    function cleanup(){ try{ delete window[name]; }catch(e){ window[name] = undefined; } }
+    function cb(errno, stdout, stderr){
+      if(done) return;
+      done = true; clearTimeout(timer); cleanup();
+      resolve({errno: errno|0, stdout: stdout||"", stderr: stderr||""});
+    }
+    var timer = setTimeout(function(){ cb(-98, "", "TIMEOUT"); }, 20000);
+    window[name] = function(errno, stdout, stderr){ cb(errno, stdout, stderr); };
+    try{
+      var ret = ksu.exec(cmd, JSON.stringify(opts || {}), name);
+      if(ret && typeof ret.then === "function"){
+        ret.then(function(x){
+          if(x && typeof x === "object") cb(x.errno, x.stdout, x.stderr);
+          else cb(0, ret == null ? "" : String(ret), "");
+        }).catch(function(e){ cb(-1, "", String(e)); });
+      } else if(typeof ret === "string" && ret && ret !== name){
+        cb(0, ret, "");
+      }
+    }catch(e){ cb(-1, "", String(e)); }
+  });
+}
+async function sh(args){
+  var r = await ksuExec("/system/bin/sh " + ACC + " " + args);
+  if(r.errno === -99 || r.errno === -98) return r;
+  if(r.errno !== 0 && !r.stdout){
+    var r2 = await ksuExec("/system/bin/sh " + ACC_ALT + " " + args);
+    if(r2.errno === 0 || r2.stdout) return r2;
+  }
+  return r;
+}
+
+/* ---------------- 主题 ---------------- */
+var THEME_KEY = "acc_keeper_theme";
+var themePref = "auto";
+try{ themePref = localStorage.getItem(THEME_KEY) || "auto"; }catch(e){}
+function systemDark(){
+  try{ return !!(window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches); }catch(e){ return false; }
+}
+function applyTheme(){
+  var dark = themePref === "dark" || (themePref === "auto" && systemDark());
+  document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+  try{ $('meta[name="color-scheme"]').setAttribute("content", dark ? "dark" : "light"); }catch(e){}
+  Array.prototype.forEach.call(document.querySelectorAll(".js-seg button"), function(b){
+    b.classList.toggle("on", b.getAttribute("data-t") === themePref);
+  });
+}
+try{
+  if(window.matchMedia){
+    var mq = matchMedia("(prefers-color-scheme: dark)");
+    var onMq = function(){ if(themePref === "auto") applyTheme(); };
+    if(mq.addEventListener) mq.addEventListener("change", onMq);
+    else if(mq.addListener) mq.addListener(onMq);
+  }
+}catch(e){}
+
+/* ---------------- 状态 ---------------- */
+var ST = {meta:{}, targets:new Set(), current:new Set(), services:[], blocked:new Set(), pkgs:[], userpkgs:[], label:new Map(), sys:new Map()};
+var UI = {onlyGuarded:false, showAll:false, q:"", busy:false, first:true};
+
+function jparse(x){
+  if(typeof x !== "string") return x;
+  try { return JSON.parse(x); } catch(e){ return null; }
+}
+function parseDump(txt){
+  ST = {meta:{}, targets:new Set(), current:new Set(), services:[], blocked:new Set(), pkgs:[], userpkgs: ST.userpkgs || [], label:new Map(), sys:new Map()};
+  (txt||"").split("\n").forEach(function(l){
+    if(!l) return;
+    var i = l.indexOf("|");
+    if(i < 0) return;
+    var k = l.slice(0,i), v = l.slice(i+1);
+    if(k === "H"){
+      var j = v.indexOf("|");
+      if(j > 0) ST.meta[v.slice(0,j)] = v.slice(j+1);
+    } else if(k === "T"){ ST.targets.add(v); }
+    else if(k === "C"){ ST.current.add(v); }
+    else if(k === "S"){
+      var bar = v.lastIndexOf("|");
+      if(bar > 0){
+        var comp = v.slice(0, bar);
+        ST.services.push(comp);
+        if(v.slice(bar + 1) === "0") ST.blocked.add(comp);
+      } else {
+        ST.services.push(v);
+      }
+    }
+    else if(k === "P"){ ST.pkgs.push(v); }
+  });
+}
+/* KernelSU 管理器是在 WebUI 打开后【异步】才抓应用列表的，
+   太早调 getPackagesInfo 只会拿到 {error:"Package not found"}，
+   所以这里要重试几次，直到拿到 appLabel。 */
+function hasInfoApi(){
+  try{ return typeof ksu !== "undefined" && ksu && typeof ksu.getPackagesInfo === "function"; }catch(e){ return false; }
+}
+function fetchInfos(list){
+  try{
+    var raw = ksu.getPackagesInfo(JSON.stringify(list));
+    var infos = jparse(raw) || [];
+    var got = 0;
+    (Array.isArray(infos) ? infos : []).forEach(function(it){
+      if(!it || !it.packageName) return;
+      if(it.appLabel){ ST.label.set(it.packageName, it.appLabel); got++; }
+      if(typeof it.isSystem === "boolean") ST.sys.set(it.packageName, it.isSystem);
+    });
+    return got;
+  }catch(e){ return 0; }
+}
+function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+
+async function enrich(list, retry){
+  /* 只查"要显示的"那些包的标签，几百个包全查会很卡 */
+  var want = (list && list.length) ? list : neededPkgs();
+  if(!want.length) return;
+
+  if(hasInfoApi()){
+    var got = fetchInfos(want);
+    if(got === 0 && retry !== false){
+      for(var i = 1; i <= 5 && got === 0; i++){
+        await sleep(300 * i);          /* 0.3s 0.6s 0.9s 1.2s */
+        got = fetchInfos(want);
+      }
+    }
+    if(got > 0) return;
+  }
+
+  /* 拿不到应用名时退回系统清单（只用来区分系统应用/用户应用） */
+  if(!ST.userpkgs.length){
+    var r = await sh("userpkgs");
+    if(r.stdout) ST.userpkgs = r.stdout.split("\n").map(function(s){ return s.trim(); }).filter(Boolean);
+  }
+}
+
+/* 需要显示的应用包名：有服务的 + 已守护的 */
+function neededPkgs(){
+  var s = new Set();
+  ST.services.forEach(function(c){ s.add(c.split("/")[0]); });
+  ST.targets.forEach(function(c){ s.add(c.split("/")[0]); });
+  return Array.from(s);
+}
+
+/* 完整包名列表：优先 KernelSU 的同步接口，拿不到再跑一次 pm（只在需要时） */
+async function ensurePkgs(){
+  if(ST.pkgs && ST.pkgs.length) return true;
+  try{
+    if(typeof ksu !== "undefined" && ksu && typeof ksu.listPackages === "function"){
+      var arr = jparse(ksu.listPackages("all"));
+      if(Array.isArray(arr) && arr.length){ ST.pkgs = arr; return true; }
+    }
+  }catch(e){}
+  var r = await sh("packages");
+  if(r.stdout){
+    ST.pkgs = r.stdout.split("\n").map(function(s){ return s.trim(); }).filter(Boolean);
+  }
+  return ST.pkgs.length > 0;
+}
+
+/* ---------------- 数据整理 ---------------- */
+function ensure(map, p){
+  if(!map.has(p)) map.set(p, {pkg:p, comps:[], guarded:false, live:false, name:p, system:false});
+  return map.get(p);
+}
+function isUserApp(p){
+  /* 优先用 KernelSU 给的 isSystem；拿不到就用 pm list packages -3 的清单 */
+  if(ST.sys.has(p)) return ST.sys.get(p) !== true;
+  if(ST.userpkgs.length) return ST.userpkgs.indexOf(p) >= 0;
+  return true;
+}
+
+function buildRows(){
+  var map = new Map();
+  ST.services.forEach(function(c){
+    var p = c.split("/")[0];
+    if(!isUserApp(p)) return;                 /* 只看手机上下载安装的应用 */
+    ensure(map, p).comps.push(c);
+  });
+  ST.targets.forEach(function(c){
+    var p = c.split("/")[0];
+    if(!isUserApp(p)) return;
+    var a = ensure(map, p);
+    a.guarded = true;
+    if(a.comps.indexOf(c) < 0) a.comps.push(c);
+  });
+  if(UI.showAll || UI.q) ST.pkgs.forEach(function(p){ if(isUserApp(p)) ensure(map, p); });
+
+  var out = [];
+  map.forEach(function(a){
+    if(UI.onlyGuarded && !a.guarded) return;
+    if(!a.comps.length && !a.guarded){
+      if(!UI.showAll) return;
+      if(ST.sys.get(a.pkg) === true && !UI.q) return;
+    }
+    a.name = ST.label.get(a.pkg) || a.pkg;
+    a.system = ST.sys.get(a.pkg) === true;
+    a.live = a.comps.some(function(c){ return ST.current.has(c); });
+    a.blocked = a.comps.length > 0 && a.comps.every(function(c){ return ST.blocked.has(c); });
+    a.on = a.guarded || a.live;
+    out.push(a);
+  });
+
+  if(UI.q){
+    out = out.filter(function(a){
+      if(a.name.toLowerCase().indexOf(UI.q) >= 0) return true;
+      if(a.pkg.toLowerCase().indexOf(UI.q) >= 0) return true;
+      return a.comps.some(function(c){ return c.toLowerCase().indexOf(UI.q) >= 0; });
+    });
+  }
+  out.sort(function(a,b){
+    function rank(x){ return x.guarded ? 0 : (x.blocked ? 2 : 1); }
+    if(rank(a) !== rank(b)) return rank(a) - rank(b);
+    return a.name.localeCompare(b.name, "zh-Hans-CN");
+  });
+  return out;
+}
+
+/* ---------------- 渲染 ---------------- */
+function esc(s){
+  return String(s).replace(/[&<>"']/g, function(c){
+    return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c];
+  });
+}
+function shortName(name, pkg){
+  var base = (name && name !== pkg) ? name : (pkg.split(".").pop() || pkg);
+  var m = base.match(/[\u4e00-\u9fa5A-Za-z0-9]/);
+  return m ? m[0].toUpperCase() : "?";
+}
+function statusText(a){
+  if(a.guarded && a.live) return {t:"守护中 · 服务运行中", c:"is-live"};
+  if(a.guarded) return {t:"守护中 · 等待恢复", c:"is-wait"};
+  if(a.live) return {t:"系统已启用 · 未纳入守护", c:"is-live"};
+  if(a.blocked) return {t:"系统不接受此服务（已记录）", c:"is-idle"};
+  if(a.comps.length) return {t:"已声明无障碍服务，未开启", c:"is-idle"};
+  return {t:"没有无障碍服务", c:"is-idle"};
+}
+function isPaused(){
+  var p = parseInt(ST.meta.paused || "0", 10);
+  return p > Math.floor(Date.now() / 1000);
+}
+function pausedLeftMin(){
+  var p = parseInt(ST.meta.paused || "0", 10);
+  var m = Math.ceil((p - Math.floor(Date.now()/1000)) / 60);
+  return m > 0 ? m : 0;
+}
+function guardedCount(){
+  var s = new Set();
+  ST.targets.forEach(function(c){ s.add(c.split("/")[0]); });
+  return s.size;
+}
+
+/* 顶部状态栏：只放"现在是什么状态"，不放统计结果 */
+function renderStatus(){
+  var dot = $(".js-dot"), name = $(".js-state"), meta = $(".js-meta");
+  var n = guardedCount();
+  var total = UI.rowCount || 0;
+  var poll = ST.meta.poll_slow || "60";
+  var parts = [];
+  /* 注意别用 className 覆盖，会把 js-dot 这个钩子一起抹掉 */
+  dot.classList.remove("is-ok", "is-warn");
+  if(isPaused()){
+    dot.classList.add("is-warn");
+    name.textContent = "已暂停";
+    parts.push("还剩 " + pausedLeftMin() + " 分钟");
+    if(total) parts.push(total + " 个应用");
+    if(n) parts.push("守护 " + n + " 个");
+  } else if(ST.meta.daemon === "1"){
+    dot.classList.add("is-ok");
+    name.textContent = "运行中";
+    if(total) parts.push(total + " 个应用");
+    parts.push(n ? "守护 " + n + " 个" : "还没选应用");
+    parts.push("每 " + poll + " 秒巡检");
+  } else {
+    name.textContent = "未运行";
+    if(total) parts.push(total + " 个应用");
+    parts.push(n ? "守护 " + n + " 个 · 重启设备可恢复" : "未配置应用");
+  }
+  meta.textContent = parts.join(" · ");
+  /* 设置面板里的动态值 */
+  $(".js-interval-val").textContent = poll + " 秒";
+  $(".js-pause-label").textContent = isPaused() ? "恢复守护" : "暂停守护 30 分钟";
+  $(".js-ver").textContent = ST.meta.ver || "";
+  $(".js-tgl-guarded").classList.toggle("on", UI.onlyGuarded);
+  $(".js-tgl-all").classList.toggle("on", UI.showAll);
+}
+
+var iconObserver = null;
+var ICON_OK = 0, ICON_FAIL = 0, ICON_OFF = false;
+var ICON_CACHE = new Set();   // 已经加载过的图标，重渲染时直接显示，不闪
+function attachIcons(scope){
+  var wraps = scope.querySelectorAll(".icon-wrap");
+  Array.prototype.forEach.call(wraps, function(wrap){
+    var img = wrap.querySelector(".app-icon");
+    var pkg = img.getAttribute("data-pkg");
+    function fallback(){
+      var l = wrap.querySelector(".icon-loader"); if(l) l.style.display = "none";
+      var f = wrap.querySelector(".icon-fallback"); if(f) f.classList.add("visible");
+    }
+    var once = function(){
+      if(img.dataset.loaded) return;
+      img.dataset.loaded = "1";
+      if(ICON_OFF){ fallback(); return; }
+      if(ICON_CACHE.has(pkg)){ var l0 = wrap.querySelector(".icon-loader"); if(l0) l0.style.display = "none"; }
+      var timer = setTimeout(function(){ if(!img.complete || !img.naturalWidth) fail(); }, 2500);
+      function ok(){
+        clearTimeout(timer); ICON_OK++; ICON_CACHE.add(pkg);
+        img.classList.add("is-loaded");
+        var l = wrap.querySelector(".icon-loader"); if(l) l.style.display = "none";
+      }
+      function fail(){
+        clearTimeout(timer); ICON_FAIL++;
+        if(ICON_OK === 0 && ICON_FAIL >= 2) ICON_OFF = true;
+        img.classList.add("is-error");
+        fallback();
+      }
+      img.onload = ok; img.onerror = fail;
+      img.src = "ksu://icon/" + pkg;
+    };
+    if("IntersectionObserver" in window){
+      if(!iconObserver){
+        iconObserver = new IntersectionObserver(function(es){
+          es.forEach(function(e){
+            if(e.isIntersecting){
+              iconObserver.unobserve(e.target);
+              if(e.target.__once) e.target.__once();
+            }
+          });
+        }, {rootMargin:"200px"});
+      }
+      wrap.__once = once;
+      iconObserver.observe(wrap);
+    } else {
+      once();
+    }
+  });
+}
+
+function renderList(){
+  var rows = buildRows();
+  var list = $(".js-list"), empty = $(".js-empty"), status = $(".js-status-text");
+
+  if(!rows.length){
+    list.innerHTML = "";
+    list.classList.remove("is-ready");
+    empty.classList.remove("hidden");
+    if(UI.q) empty.innerHTML = "没有匹配「" + esc(UI.q) + "」的应用";
+    else if(UI.onlyGuarded) empty.innerHTML = "还没有守护任何应用<br>在「设置与操作」里关掉“仅看已守护”，挑一个打开";
+    else empty.innerHTML = "没有可显示的应用";
+    UI.rowCount = 0;
+    status.textContent = "";
+    return;
+  }
+  empty.classList.add("hidden");
+
+  var animate = UI.first;
+  var html = "";
+  rows.forEach(function(a, i){
+    var st = statusText(a);
+    var delay = animate ? Math.min(i * 0.02, 0.3) : 0;
+    html += '<div class="app-card' + (animate ? " enter" : "") + '" data-pkg="' + esc(a.pkg) +
+      '" style="--enter-delay:' + delay + 's">' +
+      '<div class="icon-wrap">' +
+        '<div class="icon-loader"></div>' +
+        '<div class="icon-fallback">' + esc(shortName(a.name, a.pkg)) + '</div>' +
+        '<img class="app-icon" data-pkg="' + esc(a.pkg) + '" alt="" draggable="false">' +
+      '</div>' +
+      '<div class="app-info">' +
+        '<div class="app-name">' + esc(a.name) + '</div>' +
+        '<div class="package-name">' + esc(a.pkg) + (a.system ? " · 系统" : "") + '</div>' +
+        '<div class="app-status ' + st.c + '">' + esc(st.t) + '</div>' +
+      '</div>' +
+      '<div class="switch' + (a.on ? " is-on" : "") + (a.comps.length && !a.blocked ? "" : " is-disabled") +
+        '" role="switch" aria-checked="' + (a.on ? "true" : "false") + '" data-pkg="' + esc(a.pkg) +
+        '" data-has="' + (a.comps.length && !a.blocked ? "1" : "0") + '"><span class="switch-thumb"></span></div>' +
+    '</div>';
+  });
+  list.innerHTML = html;
+  attachIcons(list);
+
+  UI.rowCount = rows.length;
+  status.textContent = "";
+
+  UI.first = false;
+  if(animate){
+    requestAnimationFrame(function(){
+      list.classList.add("is-ready");
+      Array.prototype.forEach.call(list.querySelectorAll(".app-card"), function(c){ c.classList.remove("enter"); });
+    });
+  } else {
+    list.classList.add("is-ready");
+  }
+}
+
+function render(){ renderList(); renderStatus(); }
+
+/* ---------------- 交互 ---------------- */
+var noticeTimer = null;
+function notice(msg, kind){
+  var el = $(".js-notice");
+  if(!msg){ el.classList.add("hidden"); return; }
+  el.textContent = msg;
+  el.className = "notice js-notice" + (kind ? " is-" + kind : "");
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(function(){ el.classList.add("hidden"); }, 4200);
+}
+/* 加载中：状态行里转圈 + 文案，避免"点了没反应" */
+function busyStart(txt){
+  $(".js-status").classList.remove("idle");
+  $(".js-spin").classList.remove("hidden");
+  if(txt) $(".js-status-text").textContent = txt;
+}
+function busyEnd(){ $(".js-spin").classList.add("hidden"); $(".js-status").classList.add("idle"); }
+/* 面板打开时锁住背后的列表，不然在面板上滑会把列表滚了 */
+function lockScroll(on){
+  var m = on ? "hidden" : "";
+  document.documentElement.style.overflow = m;
+  document.body.style.overflow = m;
+  document.documentElement.classList.toggle("locked", !!on);
+  document.body.classList.toggle("locked", !!on);
+}
+
+/* 面板打开时，遮罩上的滑动不允许带动背后的列表；点遮罩关闭 */
+document.addEventListener("touchmove", function(e){
+  var sheet = e.target.closest ? e.target.closest(".sheet") : null;
+  if(!sheet) return;
+  var sc = e.target.closest(".sheet-body") || e.target.closest("pre") || e.target.closest(".form");
+  if(sc && sc.scrollHeight > sc.clientHeight + 2) return;   /* 面板内部还能滚就放行 */
+  e.preventDefault();
+}, {passive:false});
+
+/* ---------------- 本地缓存：打开时先用上次的数据秒画一屏 ---------------- */
+var CACHE_KEY = "acc_cache_v1";
+var lastDump = "";
+function saveCache(){
+  try{
+    localStorage.setItem(CACHE_KEY, JSON.stringify({
+      d: lastDump,
+      l: Array.from(ST.label.entries()),
+      s: Array.from(ST.sys.entries()),
+      t: Date.now()
+    }));
+  }catch(e){}
+}
+function loadCache(){
+  try{
+    var o = JSON.parse(localStorage.getItem(CACHE_KEY) || "null");
+    if(!o || !o.d || !o.d.length) return false;
+    if(Date.now() - (o.t || 0) > 86400000) return false;
+    parseDump(o.d);
+    (o.l || []).forEach(function(p){ ST.label.set(p[0], p[1]); });
+    (o.s || []).forEach(function(p){ ST.sys.set(p[0], p[1]); });
+    return true;
+  }catch(e){ return false; }
+}
+
+var SCAN_KEY = "acc_scan_v1";
+function pkgHash(list){
+  var h = 5381;
+  for(var i = 0; i < list.length; i++){
+    var s = list[i];
+    for(var j = 0; j < s.length; j++) h = ((h * 33) ^ s.charCodeAt(j)) & 0x7fffffff;
+  }
+  return h + "_" + list.length;
+}
+
+async function load(force){
+  busyStart(UI.hasCache ? "" : "正在加载…");
+
+  /* 包列表优先用 ksu（毫秒级），顺便判断"无障碍服务清单有没有变" */
+  await ensurePkgs();
+  var keepPkgs = ST.pkgs.slice();
+  var hash = pkgHash(keepPkgs);
+  var scan = null;
+  try{ scan = JSON.parse(localStorage.getItem(SCAN_KEY) || "null"); }catch(e){}
+  var reuse = !force && !!(scan && scan.h === hash && scan.s &&
+               (Date.now() - (scan.t || 0) < 86400000));
+
+  var r = await sh("dump" + (reuse ? " --fast" : ""));
+  if(r.errno === -99 || r.errno === -98){
+    busyEnd();
+    $(".js-status-text").textContent = "";
+    $(".js-empty").classList.remove("hidden");
+    $(".js-empty").innerHTML = r.errno === -99
+      ? "请在 KernelSU 管理器中打开本模块的 WebUI<br>（模块卡片上的「打开」按钮）"
+      : "命令超时，守护脚本没有响应。<br>在终端里跑 <b>su -c acc_ctl status</b> 看看，<br>或确认模块已启用并重启过。";
+    return;
+  }
+  if(!r.stdout){
+    busyEnd();
+    $(".js-status-text").textContent = "读取失败：" + (r.stderr || ("errno " + r.errno));
+    return;
+  }
+
+  lastDump = r.stdout;
+  parseDump(r.stdout);
+  ST.pkgs = keepPkgs;
+
+  if(reuse && scan && scan.s){
+    /* 服务清单没变：直接用上次的，少跑一次 query-services */
+    ST.services = scan.s.map(function(x){ return x[0]; });
+    ST.blocked = new Set(scan.s.filter(function(x){ return x[1] === 0; }).map(function(x){ return x[0]; }));
+    lastDump = rebuildDumpFromState();
+  } else if(ST.services.length){
+    try{
+      localStorage.setItem(SCAN_KEY, JSON.stringify({
+        h: hash,
+        s: ST.services.map(function(c){ return [c, ST.blocked.has(c) ? 0 : 1]; }),
+        t: Date.now()
+      }));
+    }catch(e){}
+  }
+  saveCache();
+
+  /* 先出列表，别让人干等（这时可能还只有包名） */
+  render();
+  busyEnd();
+
+  /* 后台补两件事：已启用的服务默认纳入守护、补齐应用名 */
+  (async function(){
+    var needAdopt = false;
+    ST.current.forEach(function(c){
+      if(ST.services.indexOf(c) >= 0 && !ST.targets.has(c)) needAdopt = true;
+    });
+    if(needAdopt){
+      await sh("adopt");
+      var r2 = await sh("dump");
+      if(r2 && r2.stdout){ var _kp = ST.pkgs.slice(); parseDump(r2.stdout); ST.pkgs = _kp; render(); }
+    }
+    var before = ST.label.size;
+    await enrich();
+    saveCache();
+    if(ST.label.size !== before) render();
+  })();
+}
+
+/* 只更新一行 + 重排，不重新拉数据（避免整屏闪烁、图标重载） */
+function updateCard(pkg, on){
+  var card = document.querySelector('.app-card[data-pkg="' + pkg + '"]');
+  if(!card) return;
+  var sw = card.querySelector(".switch");
+  sw.classList.toggle("is-on", on);
+  sw.setAttribute("aria-checked", on ? "true" : "false");
+  sw.classList.add("is-pop");
+  setTimeout(function(){ sw.classList.remove("is-pop"); }, 500);
+  var st = card.querySelector(".app-status");
+  if(st){
+    if(on){ st.textContent = "守护中 · 服务运行中"; st.className = "app-status is-live"; }
+    else if(card.querySelector(".package-name")){ st.textContent = "已声明无障碍服务，未开启"; st.className = "app-status is-idle"; }
+  }
+}
+
+function reorderCards(){
+  var list = $(".js-list");
+  var cards = Array.prototype.slice.call(list.querySelectorAll(".app-card"));
+  var order = buildRows().map(function(r){ return r.pkg; });
+  if(order.length !== cards.length){ renderList(); return; }   /* 集合变了才整屏重画 */
+  var map = {};
+  cards.forEach(function(c){ map[c.getAttribute("data-pkg")] = c; });
+  var firstTop = {};
+  cards.forEach(function(c){ firstTop[c.getAttribute("data-pkg")] = c.getBoundingClientRect().top; });
+  var frag = document.createDocumentFragment();
+  order.forEach(function(p){ if(map[p]) frag.appendChild(map[p]); });
+  list.appendChild(frag);
+  cards.forEach(function(c){
+    var p = c.getAttribute("data-pkg");
+    var dy = firstTop[p] - c.getBoundingClientRect().top;
+    if(!dy) return;
+    c.style.transition = "none";
+    c.style.transform = "translateY(" + dy + "px)";
+    requestAnimationFrame(function(){
+      c.style.transition = "transform .3s cubic-bezier(.2,.8,.2,1)";
+      c.style.transform = "";
+    });
+  });
+}
+
+async function toggle(pkg, on, el){
+  if(UI.busy || el.classList.contains("is-busy")) return;
+  UI.busy = true;
+  el.classList.add("is-busy");      /* 先转圈，成功才翻 */
+
+  var comps = ST.services.filter(function(c){ return c.split("/")[0] === pkg; });
+  var cmd = on ? ("on " + pkg + (comps.length ? " " + comps.join(" ") : "")) : ("off " + pkg);
+  var r = await sh(cmd);
+
+  el.classList.remove("is-busy");
+  UI.busy = false;
+
+  if(r.errno !== 0){
+    el.classList.add("is-fail");
+    setTimeout(function(){ el.classList.remove("is-fail"); }, 460);
+    notice((r.stdout || r.stderr || "操作失败").trim().split("\n")[0], "warn");
+    return;
+  }
+
+  /* 本地更新：写集合、改这一行、重排 —— 不重新 dump，所以不会闪 */
+  comps.forEach(function(c){
+    if(on){ ST.targets.add(c); ST.current.add(c); }
+    else { ST.targets.delete(c); ST.current.delete(c); }
+  });
+  updateCard(pkg, on);
+  renderStatus();
+  reorderCards();
+  lastDump = rebuildDumpFromState();
+  saveCache();
+}
+
+/* 把内存里的状态拼回 dump 文本，供缓存使用（不用再跑一次 shell） */
+function rebuildDumpFromState(){
+  var out = [];
+  Object.keys(ST.meta).forEach(function(k){ out.push("H|" + k + "|" + ST.meta[k]); });
+  ST.targets.forEach(function(c){ out.push("T|" + c); });
+  ST.current.forEach(function(c){ out.push("C|" + c); });
+  ST.services.forEach(function(c){ out.push("S|" + c + "|" + (ST.blocked.has(c) ? "0" : "1")); });
+  return out.join("\n") + "\n";
+}
+
+document.addEventListener("click", function(e){
+  var sw = e.target.closest ? e.target.closest(".switch") : null;
+  if(sw){
+    if(sw.getAttribute("data-has") === "0") return;
+    toggle(sw.getAttribute("data-pkg"), !sw.classList.contains("is-on"), sw);
+  }
+});
+
+$(".js-search").addEventListener("input", async function(e){
+  UI.q = e.target.value.trim().toLowerCase();
+  if(UI.q && !ST.pkgs.length){
+    busyStart("正在读取应用列表…");
+    await ensurePkgs();
+    busyEnd();
+  }
+  renderList();
+});
+
+/* ---------------- 设置面板 ---------------- */
+function openMenu(){ $(".js-menu-sheet").classList.remove("hidden"); lockScroll(true); }
+function closeMenu(){ $(".js-menu-sheet").classList.add("hidden"); lockScroll(false); }
+$(".js-more").addEventListener("click", openMenu);
+$(".js-menu-close").addEventListener("click", closeMenu);
+$(".js-menu-sheet").addEventListener("click", function(e){ if(!e.target.closest(".sheet-inner")) closeMenu(); });
+
+$(".js-only-guarded").addEventListener("click", function(){
+  UI.onlyGuarded = !UI.onlyGuarded;
+  UI.first = true;
+  renderStatus();
+  renderList();
+});
+$(".js-show-all").addEventListener("click", async function(){
+  UI.showAll = !UI.showAll;
+  UI.first = true;
+  renderStatus();
+  if(UI.showAll && !ST.pkgs.length){
+    busyStart("正在读取应用列表…");
+    await ensurePkgs();
+    await enrich(ST.pkgs);
+    busyEnd();
+  }
+  renderList();
+});
+
+$(".js-menu-pause").addEventListener("click", async function(){
+  closeMenu();
+  var r = isPaused() ? await sh("resume") : await sh("pause 30");
+  if(r.errno !== 0) notice((r.stdout || r.stderr || "操作失败").trim(), "warn");
+  await load();
+});
+
+$(".js-menu-log").addEventListener("click", async function(){
+  closeMenu();
+  openSheet("最近日志");
+  var r = await sh("log 200");
+  $(".js-sheet-body").textContent = r.stdout || "(暂无记录 · 只在服务被关闭或出错时写入)";
+});
+
+$(".js-menu-about").addEventListener("click", async function(){
+  closeMenu();
+  openSheet("关于");
+  var info = null;
+  try{
+    if(typeof ksu !== "undefined" && ksu && typeof ksu.moduleInfo === "function"){
+      var raw = ksu.moduleInfo();
+      if(raw && typeof raw.then === "function") raw = await raw;
+      info = jparse(raw);
+    }
+  }catch(e){}
+  var name = (info && info.name) || "无障碍守护";
+  var ver = (info && info.version) || ST.meta.ver || "";
+  var state = (info && info.description) || ST.meta.desc || "";
+  $(".js-sheet-body").textContent =
+    name + " " + ver + "\n\n" +
+    (state ? "当前状态\n" + state + "\n\n" : "") +
+    "开机自动启用并持续守护指定应用的无障碍服务。\n" +
+    "系统或安全中心把它关掉后自动恢复，并记录每次被关的时间与组件。\n\n" +
+    "守护列表: /data/adb/acc_keeper/targets.txt\n" +
+    "参数: /data/adb/acc_keeper/settings.conf\n" +
+    "日志: /data/adb/acc_keeper/acc_keeper.log\n\n" +
+    "命令行: su -c acc_ctl status";
+});
+
+/* 外观分段 */
+Array.prototype.forEach.call(document.querySelectorAll(".js-seg button"), function(b){
+  b.addEventListener("click", function(){
+    themePref = b.getAttribute("data-t");
+    try{ localStorage.setItem(THEME_KEY, themePref); }catch(e){}
+    applyTheme();
+  });
+});
+
+/* 轮询间隔 */
+$(".js-menu-interval").addEventListener("click", function(){
+  closeMenu();
+  $(".js-in-fast").value = ST.meta.poll_fast || "3";
+  $(".js-in-slow").value = ST.meta.poll_slow || "60";
+  var m = $(".js-interval-msg");
+  m.textContent = "";
+  m.className = "form-msg js-interval-msg";
+  $(".js-interval-sheet").classList.remove("hidden");
+  lockScroll(true);
+});
+$(".js-interval-close").addEventListener("click", function(){
+  $(".js-interval-sheet").classList.add("hidden");
+  lockScroll(false);
+});
+$(".js-interval-sheet").addEventListener("click", function(e){
+  if(!e.target.closest(".sheet-inner")){ this.classList.add("hidden"); lockScroll(false); }
+});
+$(".js-interval-save").addEventListener("click", async function(){
+  var f = parseInt($(".js-in-fast").value, 10);
+  var s = parseInt($(".js-in-slow").value, 10);
+  var m = $(".js-interval-msg");
+  if(!(f >= 1 && f <= 3600) || !(s >= 1 && s <= 3600)){
+    m.textContent = "请填 1 – 3600 之间的秒数";
+    m.className = "form-msg js-interval-msg is-warn";
+    return;
+  }
+  m.textContent = "保存中…";
+  m.className = "form-msg js-interval-msg";
+  var r = await sh("interval " + f + " " + s);
+  if(r.errno === 0){
+    m.textContent = (r.stdout || "已保存").trim().split("\n").join(" · ");
+    m.className = "form-msg js-interval-msg is-ok";
+    await load();
+  } else {
+    m.textContent = (r.stderr || r.stdout || "保存失败").trim();
+    m.className = "form-msg js-interval-msg is-warn";
+  }
+});
+
+function openSheet(title){
+  $(".js-sheet-title").textContent = title;
+  $(".js-sheet-body").textContent = "加载中…";
+  $(".js-sheet").classList.remove("hidden");
+  lockScroll(true);
+}
+$(".js-sheet-close").addEventListener("click", function(){
+  $(".js-sheet").classList.add("hidden");
+  lockScroll(false);
+});
+$(".js-sheet").addEventListener("click", function(e){
+  if(!e.target.closest(".sheet-inner")){ this.classList.add("hidden"); lockScroll(false); }
+});
+
+/* ---------------- 立即检查 ---------------- */
+$(".js-fix").addEventListener("click", async function(){
+  var fab = this;
+  if(UI.busy) return;
+  UI.busy = true;
+  fab.classList.add("is-busy");
+  busyStart("正在检查并修复…");
+  var r = await sh("apply");
+  await load(true);      /* 手动检查：强制重新扫描服务 */
+  fab.classList.remove("is-busy");
+  UI.busy = false;
+  if(r.errno !== 0) notice((r.stderr || r.stdout || "修复失败").trim(), "warn");
+});
+
+/* ---------------- 下拉刷新 ---------------- */
+(function(){
+  var ptr = $(".js-ptr"), spin = $(".js-ptr-spinner");
+  var startY = 0, dist = 0, pulling = false;
+  document.addEventListener("touchstart", function(e){
+    if(UI.busy || window.scrollY > 0) return;
+    startY = e.touches[0].clientY; pulling = true; dist = 0;
+  }, {passive:true});
+  document.addEventListener("touchmove", function(e){
+    if(!pulling) return;
+    dist = Math.max(0, e.touches[0].clientY - startY);
+    if(dist > 0){
+      ptr.classList.add("on");
+      ptr.style.height = Math.min(dist * 0.45, 56) + "px";
+    }
+  }, {passive:true});
+  document.addEventListener("touchend", async function(){
+    if(!pulling) return;
+    pulling = false;
+    if(dist > 72){
+      spin.classList.add("active");
+      ptr.style.height = "42px";
+      await load(true);
+      spin.classList.remove("active");
+    }
+    ptr.classList.remove("on");
+    ptr.style.height = "0px";
+  }, {passive:true});
+})();
+
+applyTheme();
+if(loadCache()){ UI.first = false; UI.hasCache = true; render(); }
+load();
+})();
+</script>
+</body>
+</html>

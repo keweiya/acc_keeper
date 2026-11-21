@@ -1,0 +1,652 @@
+#!/system/bin/sh
+# ==========================================================================
+#  acc_ctl —— Accessibility Keeper 控制命令 / WebUI 数据接口
+#  用法:  su -c acc_ctl <命令>
+# ==========================================================================
+export PATH=/system/bin:/system/xbin:/vendor/bin:/data/adb/ksu/bin:/data/adb/magisk:$PATH
+
+DATA_DIR=/data/adb/acc_keeper
+TARGETS_FILE=$DATA_DIR/targets.txt
+LOG_FILE=$DATA_DIR/acc_keeper.log
+PID_FILE=$DATA_DIR/daemon.pid
+PAUSE_FILE=$DATA_DIR/paused
+REJECTED_FILE=$DATA_DIR/rejected.txt
+
+MODDIR=
+for d in /data/adb/modules/acc_keeper /data/adb/modules_update/acc_keeper; do
+  if [ -f "$d/module.prop" ]; then MODDIR=$d; break; fi
+done
+[ -z "$MODDIR" ] && MODDIR=/data/adb/modules/acc_keeper
+
+# ------------------------------------------------- 工具函数
+# 让 module.prop 里的 description 跟上当前状态（KernelSU 模块卡片显示的就是它）
+refresh_desc() {
+  [ -f "$MODDIR/bin/acc_keeper.sh" ] || return 0
+  sh "$MODDIR/bin/acc_keeper.sh" --desc >/dev/null 2>&1
+}
+
+norm_one() {
+  c=$1
+  case "$c" in */*) ;; *) return 1 ;; esac
+  pkg=${c%%/*}; cls=${c#*/}
+  [ -z "$pkg" ] && return 1
+  [ -z "$cls" ] && return 1
+  case "$cls" in */*) return 1 ;; esac
+  case "$cls" in
+    .*) cls="$pkg$cls" ;;
+    *.*) ;;
+    *) cls="$pkg.$cls" ;;
+  esac
+  printf '%s/%s\n' "$pkg" "$cls"
+}
+
+norm_list() {
+  printf '%s\n' "$1" | tr -d '\r' | tr ':' '\n' | while IFS= read -r c || [ -n "$c" ]; do
+    [ -z "$c" ] && continue
+    case "$c" in null|NULL|Null) continue ;; esac
+    norm_one "$c" || continue
+  done | sort -u
+}
+
+# 换行分隔的组件列表 -> 规范化去重
+norm_lines() {
+  printf '%s\n' "$1" | tr -d '\r' | while IFS= read -r c || [ -n "$c" ]; do
+    [ -z "$c" ] && continue
+    norm_one "$c" || continue
+  done | sort -u
+}
+
+# 从 query-services 的输出里按「每块一个服务」配对 name= / packageName=。
+# 关键：必须按块配对，不能跨块 —— 跨块配位会拼出「包名来自 A、类名来自 B」
+# 这种本机上根本不存在的组件，写进设置后会被系统丢弃。
+_scan_pairs() {
+  raw=$1
+  if printf '%s' "$raw" | grep -q 'Service #'; then
+    # AOSP 格式：每个服务一段，段首是 "Service #N:"
+    { printf '%s\n' "$raw"; printf 'Service #__END__:\n'; } | while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        *"Service #"*)
+          if [ -n "${bn:-}" ]; then
+            case "$bn" in
+              */*) printf '%s|%s\n' "$bn" "${bexp:-1}" ;;
+              *) [ -n "${bp:-}" ] && printf '%s/%s|%s\n' "$bp" "$bn" "${bexp:-1}" ;;
+            esac
+          fi
+          bn=""; bp=""; bexp=1
+          ;;
+        *packageName=*)
+          [ -z "${bp:-}" ] && bp=$(printf '%s' "${line#*packageName=}" | tr -d ' \t\r')
+          ;;
+        *name=*)
+          [ -z "${bn:-}" ] && bn=$(printf '%s' "${line#*name=}" | tr -d ' \t\r')
+          ;;
+        *exported=false*)
+          bexp=0
+          ;;
+        *exported=true*)
+          bexp=1
+          ;;
+      esac
+    done
+  else
+    # 没有分段标记时只用「相邻两行」配对，宁缺毋滥
+    prevKind=""; prevVal=""
+    printf '%s\n' "$raw" | while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        *packageName=*)
+          p=$(printf '%s' "${line#*packageName=}" | tr -d ' \t\r')
+          if [ "$prevKind" = "name" ]; then
+            case "$prevVal" in
+              */*) printf '%s|1\n' "$prevVal" ;;
+              *)   [ -n "$p" ] && printf '%s/%s|1\n' "$p" "$prevVal" ;;
+            esac
+          fi
+          prevKind="pkg"; prevVal="$p"
+          ;;
+        *name=*)
+          n=$(printf '%s' "${line#*name=}" | tr -d ' \t\r')
+          if [ "$prevKind" = "pkg" ]; then
+            case "$n" in
+              */*) printf '%s|1\n' "$n" ;;
+              *)   [ -n "$prevVal" ] && printf '%s/%s|1\n' "$prevVal" "$n" ;;
+            esac
+          fi
+          prevKind="name"; prevVal="$n"
+          ;;
+        *)
+          prevKind=""; prevVal=""
+          ;;
+      esac
+    done
+  fi
+}
+
+# 枚举本机所有声明了无障碍服务的组件。
+# 不预先按 exported 过滤 —— 能不能启用由系统实际行为决定（见 rejected.txt）。
+scan_services_all() {
+  raw=$(cmd package query-services -a android.accessibilityservice.AccessibilityService 2>/dev/null)
+  a=$(printf '%s\n' "$raw" | grep -oE '[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+/(\.?[A-Za-z0-9_.$]+)')
+  b=$(_scan_pairs "$raw" | cut -d'|' -f1)
+
+  c=""
+  if [ -z "$a" ] && [ -z "$b" ]; then
+    c=$(dumpsys accessibility 2>/dev/null | grep -oE '[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+/(\.?[A-Za-z0-9_.$]+)')
+  fi
+
+  printf '%s\n%s\n%s\n' "$a" "$b" "$c" | sed -e '/^$/d' \
+    | while IFS= read -r x; do norm_one "$x"; done | sort -u
+}
+
+scan_services() { scan_services_all; }
+
+# 系统明确拒绝过的组件（试过写进去、被 AMS 丢掉），记下来免得每轮重试
+rejected_list() {
+  [ -f "$REJECTED_FILE" ] || return 0
+  sed -e 's/#.*//' "$REJECTED_FILE" 2>/dev/null | tr -d ' \r' | grep -v '^$'
+}
+is_rejected() {
+  [ -f "$REJECTED_FILE" ] || return 1
+  grep -qxF "$1" "$REJECTED_FILE" 2>/dev/null
+}
+
+targets_raw() {
+  [ -f "$TARGETS_FILE" ] || return 0
+  sed -e 's/#.*//' "$TARGETS_FILE" 2>/dev/null | tr -d ' \t\r' | grep -v '^$'
+}
+
+# 从 targets.txt 中删除某个包（或某个组件）
+_remove_target() {
+  arg=$1
+  [ -f "$TARGETS_FILE" ] || return 1
+  case "$arg" in
+    */*) exact=$(norm_one "$arg"); [ -z "$exact" ] && exact=$arg; mode=exact ;;
+    *)   exact=""; mode=pkg ;;
+  esac
+  tmp="$TARGETS_FILE.tmp.$$"
+  kept=0
+  : > "$tmp"
+  while IFS= read -r line || [ -n "$line" ]; do
+    l=$(printf '%s' "$line" | tr -d ' \t\r')
+    [ -z "$l" ] && continue
+    case "$l" in \#*) continue ;; esac
+    if [ "$mode" = "exact" ]; then
+      [ "$l" = "$exact" ] && continue
+    else
+      case "$l" in "$arg"/*) continue ;; esac
+    fi
+    printf '%s\n' "$l" >> "$tmp"
+    kept=$((kept + 1))
+  done < "$TARGETS_FILE"
+  mv -f "$tmp" "$TARGETS_FILE"
+  echo "$kept"
+}
+
+# ------------------------------------------------- 帮助
+usage() {
+  cat <<'EOF'
+acc_ctl —— 无障碍服务守护控制
+
+  su -c acc_ctl                         打开状态
+  su -c acc_ctl scan                    列出设备上所有无障碍服务（组件名）
+  su -c acc_ctl list                    查看当前守护列表
+  su -c acc_ctl add <包名|包名/类名>     把某个无障碍服务加入守护
+  su -c acc_ctl del <包名|包名/类名>     从守护列表移除
+  su -c acc_ctl on <包名>               开启该应用的无障碍服务（= 加守护 + 立即启用）
+  su -c acc_ctl off <包名>              关闭该应用的无障碍服务（= 取消守护 + 立即禁用）
+  su -c acc_ctl apply                   立即检查并修复一次
+  su -c acc_ctl status                  总览：系统值 / 守护进程 / 最近日志
+  su -c acc_ctl log [行数]              查看变更日志（默认 30 行）
+  su -c acc_ctl pause [分钟]            暂停守护（默认 30 分钟）
+  su -c acc_ctl resume                  立即恢复守护
+  su -c acc_ctl interval <快> <慢>      设置轮询间隔（秒）并重启守护进程
+  su -c acc_ctl restart                 重启守护进程（让 settings.conf 生效）
+  su -c acc_ctl adopt                   把系统里已开启的无障碍服务全部纳入守护
+  su -c acc_ctl upgrade [zip]           热更新：覆盖模块文件并重启守护，不用重装/重启设备
+  su -c acc_ctl clean                   清掉守护列表里已不存在的组件（自动备份）
+  su -c acc_ctl packages                列出已安装包名
+  su -c acc_ctl dump                    WebUI 用的结构化数据
+
+配置文件: /data/adb/acc_keeper/targets.txt
+参数文件: /data/adb/acc_keeper/settings.conf
+EOF
+}
+
+# ------------------------------------------------- 各命令
+do_scan() {
+  all=$(scan_services_all)
+  if [ -z "$all" ]; then
+    echo "没有扫描到无障碍服务（可能需要 root 权限，或设备上确实没有应用声明无障碍服务）"
+    return 1
+  fi
+  echo "设备上的无障碍服务："
+  _rej="|$(rejected_list | tr '\n' '|')"
+  _tg="|$(read_targets_norm | tr '\n' '|')"
+  printf '%s\n' "$all" | while IFS= read -r c; do
+    [ -z "$c" ] && continue
+    case "$_tg" in
+      *"|$c|"*) tag="[已守护]" ;;
+      *)
+        case "$_rej" in
+          *"|$c|"*) tag="[系统拒]" ;;
+          *) tag="[可用]  " ;;
+        esac
+        ;;
+    esac
+    printf '  %s %s\n' "$tag" "$c"
+  done
+}
+
+do_list() {
+  out=$(targets_raw)
+  if [ -z "$out" ]; then echo "(空，用 acc_ctl add 或 WebUI 开关添加)"; return 0; fi
+  echo "$out"
+}
+
+do_add() {
+  arg=$1
+  [ -z "$arg" ] && { echo "用法: acc_ctl add <包名|包名/类名>"; return 1; }
+  case "$arg" in
+    */*) comp=$(norm_one "$arg"); [ -z "$comp" ] && { echo "组件格式无效: $arg"; return 1; } ;;
+    *)
+      list=$(scan_services | grep "^$arg/")
+      n=$(printf '%s\n' "$list" | grep -c .)
+      if [ "$n" -eq 0 ]; then
+        echo "未找到 $arg 的无障碍服务。先运行 acc_ctl scan 看完整组件名。"
+        return 1
+      elif [ "$n" -gt 1 ]; then
+        echo "$arg 有多个无障碍服务，请指定完整组件："
+        printf '%s\n' "$list"
+        return 1
+      fi
+      comp=$(norm_one "$list")
+      ;;
+  esac
+  mkdir -p "$DATA_DIR"; touch "$TARGETS_FILE"
+  if grep -qxF "$comp" "$TARGETS_FILE"; then
+    echo "已在守护列表中: $comp"
+  else
+    echo "$comp" >> "$TARGETS_FILE"
+    echo "已加入守护: $comp"
+  fi
+  echo "--- 立即应用 ---"
+  sh "$MODDIR/bin/acc_keeper.sh" --once
+  tail -n 3 "$LOG_FILE" 2>/dev/null | sed 's/^/  /'
+}
+
+do_del() {
+  arg=$1
+  [ -z "$arg" ] && { echo "用法: acc_ctl del <包名|包名/类名>"; return 1; }
+  [ -f "$TARGETS_FILE" ] || { echo "守护列表是空的"; return 1; }
+  before=$(targets_raw | grep -c .)
+  kept=$(_remove_target "$arg")
+  if [ "$before" = "$kept" ]; then
+    echo "守护列表里没有匹配「$arg」的条目"
+  else
+    echo "已移除，剩余 $kept 条"
+  fi
+  echo "注意：只是从守护列表删除，不会主动关掉系统里已启用的服务"
+  refresh_desc
+}
+
+# 热更新：把新 zip 里的文件直接覆盖到模块目录，不重装、不重启设备
+#   acc_ctl upgrade                  # 用 /sdcard/Documents 下最新的 acc_keeper-v*.zip
+#   acc_ctl upgrade /path/to/x.zip
+do_upgrade() {
+  z=$1
+  if [ -z "$z" ]; then
+    z=$(ls -t /sdcard/Documents/acc_keeper-v*.zip 2>/dev/null | head -n 1)
+  fi
+  if [ -z "$z" ] || [ ! -f "$z" ]; then
+    echo "用法: acc_ctl upgrade [zip 路径]"
+    [ -d /sdcard/Documents ] && ls -t /sdcard/Documents/acc_keeper-v*.zip 2>/dev/null | head -n 3
+    return 1
+  fi
+
+  uz=""
+  for c in /data/adb/ksu/bin/busybox /data/adb/magisk/busybox; do
+    if [ -x "$c" ]; then uz="$c"; break; fi
+  done
+  [ -z "$uz" ] && uz=$(command -v unzip 2>/dev/null)
+
+  if [ -n "$uz" ]; then
+    "$uz" unzip -o "$z" -d "$MODDIR" >/dev/null 2>&1 || { echo "解压失败: $z"; return 1; }
+  else
+    echo "找不到 unzip，请用管理器安装"
+    return 1
+  fi
+
+  chmod 755 "$MODDIR/bin/acc_ctl" "$MODDIR/bin/acc_keeper.sh" "$MODDIR/system/bin/acc_ctl" 2>/dev/null
+  chmod 644 "$MODDIR/webroot/index.html" "$MODDIR/module.prop" 2>/dev/null
+  newver=$(sed -n 's/^version=//p' "$MODDIR/module.prop" 2>/dev/null | head -n 1)
+  echo "已覆盖安装: $z"
+  echo "当前版本: $newver"
+  do_restart
+}
+
+# 已安装包名（WebUI 在拿不到 ksu.listPackages 时才用）
+do_packages() {
+  if [ "$1" = "-3" ] || [ "$1" = "user" ]; then
+    pm list packages -3 2>/dev/null | sed -n 's/^package://p' | sort -u
+  else
+    pm list packages 2>/dev/null | sed -n 's/^package://p' | sort -u
+  fi
+}
+
+# 把"系统里已经开着"的无障碍服务纳入守护（默认全部守护）
+do_adopt() {
+  list=$(scan_services)
+  if [ -z "$list" ]; then
+    echo "扫描不到无障碍服务，跳过"
+    return 1
+  fi
+  cur=$(norm_list "$(settings get secure enabled_accessibility_services 2>/dev/null)")
+  mkdir -p "$DATA_DIR"; touch "$TARGETS_FILE"
+  added=0
+  for c in $cur; do
+    printf "%s\n" "$list" | grep -qxF "$c" || continue
+    is_rejected "$c" && continue
+    grep -qxF "$c" "$TARGETS_FILE" && continue
+    printf '%s\n' "$c" >> "$TARGETS_FILE"
+    added=$((added + 1))
+  done
+  if [ "$added" -gt 0 ]; then
+    refresh_desc
+    echo "已纳入 $added 个已启用的服务"
+  else
+    echo "没有需要纳入的服务"
+  fi
+}
+
+# 清洗守护列表：把"已经不存在于本机"的组件删掉（跨块配对 bug 留下的垃圾）
+do_clean() {
+  list=$(norm_lines "$(scan_services)")
+  if [ -z "$list" ]; then
+    echo "扫描不到任何无障碍服务，为避免误删，先不清理"
+    return 1
+  fi
+  [ -f "$TARGETS_FILE" ] || { echo "守护列表是空的"; return 0; }
+  tmp="$TARGETS_FILE.tmp.$$"
+  kept=0; dropped=0
+  : > "$tmp"
+  while IFS= read -r line || [ -n "$line" ]; do
+    l=$(printf '%s' "$line" | tr -d ' \t\r')
+    [ -z "$l" ] && continue
+    case "$l" in \#*) continue ;; esac
+    c=$(norm_one "$l")
+    if [ -n "$c" ] && printf "%s\n" "$list" | grep -qxF "$c" && ! is_rejected "$c"; then
+      printf '%s\n' "$c" >> "$tmp"
+      kept=$((kept + 1))
+    else
+      dropped=$((dropped + 1))
+    fi
+  done < "$TARGETS_FILE"
+  mv -f "$tmp" "$TARGETS_FILE"
+  echo "清理完成：保留 $kept 条，移除 $dropped 条不存在的组件"
+  refresh_desc
+  sh "$MODDIR/bin/acc_keeper.sh" --once >/dev/null 2>&1
+  tail -n 4 "$LOG_FILE" 2>/dev/null | sed 's/^/  /'
+}
+
+# WebUI 开关：整包开
+do_on() {
+  pkg=$1
+  [ -z "$pkg" ] && { echo "用法: acc_ctl on <包名> [组件...]"; return 1; }
+  shift
+  if [ $# -gt 0 ]; then
+    # WebUI 直接把已知的组件传过来，省掉一次 query-services（约 0.4 秒）
+    comps=$(for c in "$@"; do norm_one "$c"; done | sort -u)
+  else
+    comps=$(scan_services | grep "^$pkg/" | while IFS= read -r c; do norm_one "$c"; done | sort -u)
+  fi
+  if [ -z "$comps" ]; then
+    echo "该应用没有声明无障碍服务"
+    return 2
+  fi
+  # 跳过被系统明确拒绝过的组件
+  usable=""
+  for c in $comps; do
+    is_rejected "$c" && continue
+    usable="$usable $c"
+  done
+  if [ -z "$usable" ]; then
+    echo "系统不接受该应用的无障碍服务（会被自动丢弃）"
+    return 3
+  fi
+  mkdir -p "$DATA_DIR"; touch "$TARGETS_FILE"
+  for c in $usable; do
+    grep -qxF "$c" "$TARGETS_FILE" || echo "$c" >> "$TARGETS_FILE"
+  done
+  sh "$MODDIR/bin/acc_keeper.sh" --once --fast
+  echo "OK"
+}
+
+# WebUI 开关：整包关（取消守护 + 立即从系统里摘掉）
+do_off() {
+  pkg=$1
+  [ -z "$pkg" ] && { echo "用法: acc_ctl off <包名>"; return 1; }
+  [ -f "$TARGETS_FILE" ] && _remove_target "$pkg" >/dev/null
+  cur=$(norm_list "$(settings get secure enabled_accessibility_services 2>/dev/null)")
+  keep=$(printf '%s\n' "$cur" | grep -v "^$pkg/" | grep -v '^$')
+  new_val=$(printf '%s\n' "$keep" | sed '/^$/d' | sort -u | tr '\n' ':' | sed 's/:$//')
+  settings put secure enabled_accessibility_services "$new_val" 2>/dev/null
+  echo "OK"
+  refresh_desc
+}
+
+do_status() {
+  refresh_desc
+  echo "模块状态: $(sed -n 's/^description=//p' "$MODDIR/module.prop" 2>/dev/null | head -n 1)"
+  echo
+  echo "=========== 守护目标 ==========="
+  do_list | sed 's/^/  /'
+  echo
+  echo "=========== 系统当前 ==========="
+  echo "  accessibility_enabled = $(settings get secure accessibility_enabled 2>/dev/null)"
+  settings get secure enabled_accessibility_services 2>/dev/null | tr ':' '\n' | while IFS= read -r l; do
+    [ -n "$l" ] && [ "$l" != "null" ] && echo "  $l"
+  done
+  echo
+  echo "=========== 守护进程 ==========="
+  pid=$(cat "$PID_FILE" 2>/dev/null)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    echo "  运行中 (pid $pid)"
+  else
+    echo "  未运行（重启后由 service.sh 自动拉起；手动启动: sh $MODDIR/bin/acc_keeper.sh &）"
+  fi
+  [ -f "$PAUSE_FILE" ] && echo "  已暂停至: $(cat "$PAUSE_FILE" 2>/dev/null) (epoch)"
+  echo
+  echo "=========== 最近日志 ==========="
+  tail -n 8 "$LOG_FILE" 2>/dev/null | sed 's/^/  /'
+  [ -s "$LOG_FILE" ] || echo "  (暂无日志)"
+}
+
+do_pause() {
+  mins=${1:-30}
+  case "$mins" in ''|*[!0-9]*) mins=30 ;; esac
+  mkdir -p "$DATA_DIR"
+  echo $(( $(date +%s) + mins * 60 )) > "$PAUSE_FILE"
+  echo "已暂停守护 $mins 分钟。恢复: acc_ctl resume"
+  refresh_desc
+}
+
+do_resume() {
+  rm -f "$PAUSE_FILE"
+  echo "已恢复守护"
+  sh "$MODDIR/bin/acc_keeper.sh" --once
+}
+
+# 重启守护进程（改完 settings.conf 后让新参数生效）
+do_restart() {
+  # 跨 PID 命名空间时 kill 打不到别的会话起的进程（实测 kill 返回成功但进程还在），
+  # 所以用停止文件通知守护进程自己退出，再等它消失。
+  mkdir -p "$DATA_DIR" 2>/dev/null
+  : > "$DATA_DIR/.stop" 2>/dev/null
+
+  i=0
+  while [ $i -lt 30 ]; do
+    _alive=0
+    for _d in /proc/[0-9]*; do
+      _p=${_d#/proc/}
+      case "$_p" in "$$"|"$PPID") continue ;; esac
+      _cmd=$(tr '\0' ' ' < "$_d/cmdline" 2>/dev/null) || continue
+      case "$_cmd" in
+        "sh $MODDIR/bin/acc_keeper.sh"|"sh $MODDIR/bin/acc_keeper.sh "|\
+        "/system/bin/sh $MODDIR/bin/acc_keeper.sh"|"/system/bin/sh $MODDIR/bin/acc_keeper.sh ")
+          _alive=1; break ;;
+      esac
+    done
+    [ "$_alive" = "0" ] && break
+    sleep 0.5
+    i=$((i + 1))
+  done
+
+  rm -f "$DATA_DIR/.stop" "$PID_FILE" 2>/dev/null
+  nohup sh "$MODDIR/bin/acc_keeper.sh" >/dev/null 2>&1 &
+  sleep 1
+  newpid=$(cat "$PID_FILE" 2>/dev/null)
+  if [ -n "$newpid" ] && kill -0 "$newpid" 2>/dev/null; then
+    echo "守护进程已重启 (pid $newpid)"
+  else
+    echo "重启失败，下次开机由 service.sh 拉起"
+  fi
+}
+
+# 设置轮询间隔：例如 acc_ctl interval 5 60
+do_interval() {
+  f=$1
+  s=$2
+  case "$f" in ''|*[!0-9]*) echo "用法: acc_ctl interval <快速轮询秒> <稳定轮询秒>"; return 1 ;; esac
+  case "$s" in ''|*[!0-9]*) echo "用法: acc_ctl interval <快速轮询秒> <稳定轮询秒>"; return 1 ;; esac
+  [ "$f" -lt 1 ] && f=1
+  [ "$f" -gt 3600 ] && f=3600
+  [ "$s" -lt 1 ] && s=1
+  [ "$s" -gt 3600 ] && s=3600
+
+  mkdir -p "$DATA_DIR"
+  conf=$DATA_DIR/settings.conf
+  tmp=$conf.tmp.$$
+  if [ -f "$conf" ]; then
+    sed -e "s/^POLL_FAST=.*/POLL_FAST=$f/" -e "s/^POLL_SLOW=.*/POLL_SLOW=$s/" "$conf" > "$tmp"
+    grep -q '^POLL_FAST=' "$tmp" || printf 'POLL_FAST=%s\n' "$f" >> "$tmp"
+    grep -q '^POLL_SLOW=' "$tmp" || printf 'POLL_SLOW=%s\n' "$s" >> "$tmp"
+  else
+    printf 'POLL_FAST=%s\nPOLL_SLOW=%s\n' "$f" "$s" > "$tmp"
+  fi
+  mv -f "$tmp" "$conf"
+  refresh_desc
+  echo "快速轮询 ${f}s / 稳定轮询 ${s}s"
+  do_restart
+}
+
+# 只输出组件名（守护进程校验用：本机已经不存在的组件要摘掉）
+do_scan_list() { scan_services; }
+
+# 立即检查：跑一轮 apply，然后打印几行结果（action.sh / 命令行用）
+do_check() {
+  tgt=$(read_targets_norm)
+  appn=$(printf '%s\n' "$tgt" | sed 's#/.*##' | sort -u | grep -c .)
+  before=$(norm_list "$(settings get secure enabled_accessibility_services 2>/dev/null)")
+  b_n=$(printf '%s\n' "$before" | grep -c .)
+  b_ae=$(settings get secure accessibility_enabled 2>/dev/null)
+
+  sh "$MODDIR/bin/acc_keeper.sh" --once >/dev/null 2>&1
+
+  after=$(norm_list "$(settings get secure enabled_accessibility_services 2>/dev/null)")
+  a_n=$(printf '%s\n' "$after" | grep -c .)
+  a_ae=$(settings get secure accessibility_enabled 2>/dev/null)
+
+  echo "守护目标: ${appn} 个应用"
+  echo "系统启用: ${b_n} → ${a_n} 个无障碍服务"
+
+  if [ "$a_n" -gt "$b_n" ]; then
+    echo "结果: 已恢复 $((a_n - b_n)) 个服务"
+  elif [ "$b_ae" != "1" ] && [ "$a_ae" = "1" ]; then
+    echo "结果: 总开关已重新打开"
+  else
+    echo "结果: 状态正常，无需修复"
+  fi
+
+  rj=$(rejected_list | grep -c .)
+  if [ "$rj" -gt 0 ]; then echo "注意: ${rj} 个服务被系统拒绝启用（rejected.txt）"; fi
+  echo "日志: su -c acc_ctl log 20"
+}
+
+# 清空"系统拒绝"名单（应用更新后想重新试一次时用）
+do_reset_rejected() {
+  n=$(rejected_list | grep -c .)
+  rm -f "$REJECTED_FILE"
+  echo "已清空 ${n} 条拒绝记录，重新打开开关会再试一次"
+}
+# WebUI 数据：H=元信息 T=守护 C=系统已启用 S=已安装无障碍服务 P=已安装包
+do_dump() {
+  # 一次 app_process 唤醒拿回两个设置值，别分成两次
+  _s=$(settings list secure 2>/dev/null)
+  _ae=$(printf '%s\n' "$_s" | sed -n 's/^accessibility_enabled=//p' | head -n 1)
+  _eas=$(printf '%s\n' "$_s" | sed -n 's/^enabled_accessibility_services=//p' | head -n 1)
+  [ -z "$_ae" ] && _ae=$(settings get secure accessibility_enabled 2>/dev/null)
+  [ -z "$_eas" ] && _eas=$(settings get secure enabled_accessibility_services 2>/dev/null)
+
+  pid=$(cat "$PID_FILE" 2>/dev/null)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo "H|daemon|1"; else echo "H|daemon|0"; fi
+  echo "H|enabled|$_ae"
+  echo "H|paused|$(cat "$PAUSE_FILE" 2>/dev/null || echo 0)"
+  _fx=$(cat "$DATA_DIR/fixes.count" 2>/dev/null)
+  case "$_fx" in ''|*[!0-9]*) _fx=0 ;; esac
+  echo "H|fixes|$_fx"
+  echo "H|ver|$(sed -n 's/^version=//p' "$MODDIR/module.prop" 2>/dev/null | head -n 1)"
+  echo "H|desc|$(sed -n 's/^description=//p' "$MODDIR/module.prop" 2>/dev/null | head -n 1)"
+  pf=$(. "$DATA_DIR/settings.conf" 2>/dev/null; echo "${POLL_FAST:-3}")
+  ps=$(. "$DATA_DIR/settings.conf" 2>/dev/null; echo "${POLL_SLOW:-60}")
+  echo "H|poll_fast|$pf"
+  echo "H|poll_slow|$ps"
+  printf '%s\n' "$(read_targets_norm)" | sed '/^$/d' | while IFS= read -r c; do echo "T|$c"; done
+  printf '%s\n' "$(norm_list "$_eas")" | sed '/^$/d' | while IFS= read -r c; do echo "C|$c"; done
+  if [ "$1" != "--fast" ]; then
+    _rej="|$(rejected_list | tr '\n' '|')"
+    scan_services_all | while IFS= read -r _c; do
+      [ -z "$_c" ] && continue
+      case "$_rej" in
+        *"|$_c|"*) echo "S|$_c|0" ;;
+        *) echo "S|$_c|1" ;;
+      esac
+    done
+  fi
+  # 包列表不在这里给：WebUI 优先用 ksu.listPackages（瞬时），拿不到再调 acc_ctl packages
+}
+
+read_targets_norm() {
+  [ -f "$TARGETS_FILE" ] || return 0
+  sed -e 's/#.*//' "$TARGETS_FILE" 2>/dev/null | tr -d ' \t\r' | while IFS= read -r c || [ -n "$c" ]; do
+    [ -z "$c" ] && continue
+    norm_one "$c" || continue
+  done | sort -u
+}
+
+cmd=$1
+[ $# -gt 0 ] && shift
+case "$cmd" in
+  scan)          do_scan ;;
+  list|ls)       do_list ;;
+  add)           do_add "$@" ;;
+  del|rm|remove) do_del "$@" ;;
+  on|enable)     do_on "$@" ;;
+  off|disable)   do_off "$@" ;;
+  apply)         sh "$MODDIR/bin/acc_keeper.sh" --once; tail -n 5 "$LOG_FILE" 2>/dev/null | sed 's/^/  /' ;;
+  status|st)     do_status ;;
+  log|logs)      tail -n "${1:-30}" "$LOG_FILE" 2>/dev/null || echo "(暂无日志)" ;;
+  pause)         do_pause "$@" ;;
+  resume)        do_resume ;;
+  interval)      do_interval "$@" ;;
+  restart)       do_restart ;;
+  clean)         do_clean ;;
+  adopt)         do_adopt ;;
+  upgrade)       do_upgrade "$@" ;;
+  scan-list)     do_scan_list ;;
+  check)         do_check ;;
+  reset-rejected) do_reset_rejected ;;
+  packages)      do_packages "$@" ;;
+  userpkgs)      do_packages -3 ;;
+  dump)          do_dump "$@" ;;
+  ''|help|-h|--help) do_status; echo; usage ;;
+  *) echo "未知命令: $cmd"; echo; usage; exit 1 ;;
+esac
