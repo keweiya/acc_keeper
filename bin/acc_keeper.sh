@@ -480,6 +480,10 @@ if [ -z "$_prev_boot" ] || [ "$_cur_boot" != "$_prev_boot" ]; then
   rm -f "$LOG_DIR"/*.log "$LOG_DIR"/*.log.* 2>/dev/null
   : > "$LOG_FILE"
   printf '%s\n' "$_cur_boot" > "$BOOT_STATE_FILE"
+  # 新开机周期：修复/检查计数一起归零，卡片描述里不再带上一次开机的旧数字
+  printf '0' > "$FIXES_FILE" 2>/dev/null
+  printf '0' > "$TICKS_FILE" 2>/dev/null
+  TICKS=0
 fi
 
 log "=== 守护启动 ${ACC_VERSION} (pid $$) ==="
