@@ -12,7 +12,9 @@ fi
 DATA_DIR=/data/adb/acc_keeper
 ui_print "- 安装 无障碍守护 (acc_keeper)"
 
-mkdir -p "$DATA_DIR"
+umask 077
+mkdir -p "$DATA_DIR/logs" "$DATA_DIR/state" "$DATA_DIR/locks"
+chmod 700 "$DATA_DIR/logs" "$DATA_DIR/state" "$DATA_DIR/locks" 2>/dev/null
 chmod 700 "$DATA_DIR" 2>/dev/null
 
 # 保留已有配置，只在缺失时写入默认值

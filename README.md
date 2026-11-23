@@ -21,13 +21,13 @@ accessibility_enabled = 1
 
 ## 日志
 
-`/data/adb/acc_keeper/acc_keeper.log`，用 `su -c acc_ctl log 50` 看最后 50 行。
+`/data/adb/acc_keeper/logs/acc_keeper.log`，用 `su -c acc_ctl log 50` 看最后 50 行。
 
 默认（`VERBOSE=0`）记的全是关键事件：
 
 | 行首 | 含义 |
 | --- | --- |
-| `=== 守护启动 v1.22.0 (pid N)` | 进程起来。紧跟的几行给出设备型号 / Android 版本 / 内核 / boot_id / 已开机时长 / **启动类型**（`设备重启` = boot_id 变了，`进程重启` = boot_id 没变）/ 上次退出原因 / 生效配置 / 目标清单 |
+| `=== 守护启动 v1.23.0 (pid N)` | 进程起来。紧跟的几行给出设备型号 / Android 版本 / 内核 / boot_id / 已开机时长 / **启动类型**（`设备重启` = boot_id 变了，`进程重启` = boot_id 没变）/ 上次退出原因 / 生效配置 / 目标清单 |
 | `--- 守护退出 pid=N 原因=… 运行=… 累计检查=N 修复=N` | 退出原因（`.stop` 标记 / SIGTERM / SIGHUP / SIGINT）与本次运行时长、检查次数 |
 | `♥ 心跳: 运行 2小时0分 检查 #120 修复 8 目标 5 个 间隔 60s` | 每 `HEARTBEAT_SECONDS`（默认 1800 秒）一条存活记录。判断"守护还在不在跑"先看这条 |
 | `!! 守护的服务被移除 N 个: …` | 目标从系统列表里消失（数量 + 前 3 个组件） |
@@ -68,7 +68,7 @@ KernelSU 管理器 → 模块卡片 → **打开**。
 - 只显示**手机上下载安装的应用**（`isSystem=false`），设置、TalkBack、系统界面这类系统应用不进来
 - 应用名是异步补上的：KernelSU 管理器要等 WebUI 打开后才去抓应用列表，所以列表会先出包名、1~3 秒后自动换成中文名（重试 5 次）
 - 已守护的排最上面，第三行按已选择的守护目标显示：系统已启用 / 等待恢复；若守护进程未运行，会单独标明
-- 不做静态过滤：能不能启用由系统实际行为决定。第一次写进去被系统丢弃的组件，会记到 `/data/adb/acc_keeper/rejected.txt`，界面标"系统不接受此服务（已记录）"、开关置灰、不再重试；应用更新后重新打开成功的话，记录会自动清掉
+- 不做静态过滤：能不能启用由系统实际行为决定。第一次写进去被系统丢弃的组件，会记到 `/data/adb/acc_keeper/state/rejected.txt`，界面标"系统不接受此服务（已记录）"、开关置灰、不再重试；应用更新后重新打开成功的话，记录会自动清掉
 - 开关 = 立即开启或关闭该应用的无障碍服务（关掉会同时取消守护，不然会被弹回来）
 
 **⋯ 打开「设置与操作」底部面板**（iOS 分组列表样式）：
@@ -153,7 +153,7 @@ su -c acc_ctl clean                   # 清掉守护列表里本机已不存在�
 
 ## 日志
 
-`/data/adb/acc_keeper/acc_keeper.log`：上限 **1MB**，超过就滚动覆盖（只保留最新的一半），不会无限长大。
+`/data/adb/acc_keeper/logs/acc_keeper.log`：**每次设备重启重新生成**（`post-fs-data.sh` 和守护启动各清一次），单次开机内上限 **1MB**，超过就滚动覆盖（只保留最新的一半），不会无限长大。
 
 **默认只记事件和错误**，启动、新增、每次恢复的明细都不写（`VERBOSE=1` 才写）：
 
@@ -174,11 +174,34 @@ su -c acc_ctl clean                   # 清掉守护列表里本机已不存在�
 
 要排查问题就把 `/data/adb/acc_keeper/settings.conf` 里的 `VERBOSE` 改成 1 再 `acc_ctl restart`，会额外记录进程启动、新启用、每轮恢复的完整明细。
 
-## 配置文件
+## 配置文件与目录
 
-- `/data/adb/acc_keeper/targets.txt` — 守护列表，一行一个组件，支持 `#` 注释
-- `/data/adb/acc_keeper/settings.conf` — `POLL_FAST` / `POLL_SLOW` / `BOOT_FAST_SECONDS` / `BOOST_TICKS` / `STRICT`
-- `/data/adb/acc_keeper/acc_keeper.log` — 变更日志（超过 1MB 自动截半）
+数据目录 `/data/adb/acc_keeper/` 只有两层：根目录放用户文件，运行时文件按用途分目录。
+
+```
+/data/adb/acc_keeper/
+├── targets.txt     守护列表，一行一个组件，支持 # 注释
+├── settings.conf   POLL_FAST / POLL_SLOW / BOOT_FAST_SECONDS / BOOST_TICKS / STRICT
+├── logs/
+│   └── acc_keeper.log   本轮开机的日志（设备重启时清空重建）
+├── state/
+│   ├── daemon.pid       守护进程身份（pid + 启动时刻 + boot_id）
+│   ├── last_good        上次确认在线的目标
+│   ├── last_boot        上次记录的 boot_id
+│   ├── last_exit        上次退出摘要
+│   ├── last_fail        失败节流签名与时间
+│   ├── rejected.txt     被系统拒绝的组件（不再重试）
+│   ├── fixes.count      累计修复次数
+│   ├── ticks.count      累计检查次数
+│   ├── paused           暂停到期时间戳
+│   └── stop             停止标记
+└── locks/
+    ├── daemon.lock      守护单实例锁
+    ├── work.lock        巡检 / 目标修改互斥锁
+    └── lifecycle.lock   启动 / 停止 / 重启互斥锁
+```
+
+旧版平铺在根目录的文件（`acc_keeper.log`、`daemon.pid`、`.last_boot`、`.daemon.lock` 等）会在首次运行新版本时自动搬到上面的位置，无需手工处理。
 
 `STRICT` 是旧版兼容字段；当前守护与点检始终保留系统中未选入守护的服务。
 
@@ -196,7 +219,7 @@ su -c acc_ctl status              # 守护进程是否在跑、系统里的值�
 ```
 
 - `dump` 有 `H|` `T|` `S|` `P|` 行 → 模块正常。WebUI 还空着，就把这条命令的完整输出发我。
-- `dump` 报错/无输出 → 模块侧问题，看 `acc_ctl status` 和 `/data/adb/acc_keeper/acc_keeper.log`。
+- `dump` 报错/无输出 → 模块侧问题，看 `acc_ctl status` 和 `/data/adb/acc_keeper/logs/acc_keeper.log`。
 
 **扫描不到任何无障碍服务**（列表只剩"没有可显示的应用"）
 

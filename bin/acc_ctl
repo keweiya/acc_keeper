@@ -6,11 +6,20 @@
 export PATH=/system/bin:/system/xbin:/vendor/bin:/data/adb/ksu/bin:/data/adb/magisk:$PATH
 
 DATA_DIR=${ACC_KEEPER_DATA_DIR:-/data/adb/acc_keeper}
+LOG_DIR=$DATA_DIR/logs
+STATE_DIR=$DATA_DIR/state
+LOCK_DIR=$DATA_DIR/locks
 TARGETS_FILE=$DATA_DIR/targets.txt
-LOG_FILE=$DATA_DIR/acc_keeper.log
-PID_FILE=$DATA_DIR/daemon.pid
-PAUSE_FILE=$DATA_DIR/paused
-REJECTED_FILE=$DATA_DIR/rejected.txt
+LOG_FILE=$LOG_DIR/acc_keeper.log
+PID_FILE=$STATE_DIR/daemon.pid
+PAUSE_FILE=$STATE_DIR/paused
+REJECTED_FILE=$STATE_DIR/rejected.txt
+FIXES_FILE=$STATE_DIR/fixes.count
+FAIL_FILE=$STATE_DIR/last_fail
+STOP_FILE=$STATE_DIR/stop
+DAEMON_LOCK=$LOCK_DIR/daemon.lock
+WORK_LOCK=$LOCK_DIR/work.lock
+LIFECYCLE_LOCK=$LOCK_DIR/lifecycle.lock
 
 if [ -n "${ACC_KEEPER_MODDIR:-}" ]; then
   MODDIR=$ACC_KEEPER_MODDIR
@@ -24,6 +33,7 @@ fi
 [ -r "$MODDIR/bin/acc_runtime.sh" ] || { echo "模块缺少进程身份辅助脚本" >&2; exit 1; }
 export MODDIR
 . "$MODDIR/bin/acc_runtime.sh"
+acc_init_layout || exit 1
 
 # ------------------------------------------------- 工具函数
 # 让 module.prop 里的 description 跟上当前状态（KernelSU 模块卡片显示的就是它）
@@ -269,7 +279,7 @@ do_add() {
       comp=$(norm_one "$list")
       ;;
   esac
-  mkdir -p "$DATA_DIR"; touch "$TARGETS_FILE"
+  acc_init_layout; touch "$TARGETS_FILE"
   if grep -qxF "$comp" "$TARGETS_FILE"; then
     echo "已在守护列表中: $comp"
   else
@@ -402,7 +412,7 @@ do_on() {
     echo "系统不接受该应用的无障碍服务（会被自动丢弃）"
     return 3
   fi
-  mkdir -p "$DATA_DIR"; touch "$TARGETS_FILE"
+  acc_init_layout; touch "$TARGETS_FILE"
   for c in $usable; do
     grep -qxF "$c" "$TARGETS_FILE" || echo "$c" >> "$TARGETS_FILE"
   done
@@ -503,9 +513,9 @@ do_status() {
 do_pause() {
   mins=${1:-30}
   case "$mins" in ''|*[!0-9]*) mins=30 ;; esac
-  mkdir -p "$DATA_DIR"
+  acc_init_layout
   acc_lock_init || { echo "无法取得检查锁"; return 1; }
-  "$ACC_LOCK_TOOL" flock "$DATA_DIR/.work.lock" sh "$MODDIR/bin/acc_ctl" _pause_locked "$mins" || return 1
+  "$ACC_LOCK_TOOL" flock "$WORK_LOCK" sh "$MODDIR/bin/acc_ctl" _pause_locked "$mins" || return 1
   echo "已暂停守护 $mins 分钟。恢复: acc_ctl resume"
   refresh_desc
 }
@@ -516,9 +526,9 @@ do_pause_locked() {
 }
 
 do_resume() {
-  mkdir -p "$DATA_DIR"
+  acc_init_layout
   acc_lock_init || { echo "无法取得检查锁"; return 1; }
-  "$ACC_LOCK_TOOL" flock "$DATA_DIR/.work.lock" sh "$MODDIR/bin/acc_ctl" _resume_locked || return 1
+  "$ACC_LOCK_TOOL" flock "$WORK_LOCK" sh "$MODDIR/bin/acc_ctl" _resume_locked || return 1
   echo "已恢复守护"
   sh "$MODDIR/bin/acc_keeper.sh" --once
 }
@@ -526,15 +536,15 @@ do_resume_locked() { rm -f "$PAUSE_FILE"; }
 
 # restart 和 check 的启动阶段串行；先校验进程身份再发信号，绝不按未验证的 PID 发。
 do_restart() {
-  mkdir -p "$DATA_DIR" || return 1
+  acc_init_layout || return 1
   acc_lock_init || { echo "无法取得启动锁"; return 1; }
-  "$ACC_LOCK_TOOL" timeout 35 "$ACC_LOCK_TOOL" flock "$DATA_DIR/.lifecycle.lock" sh "$MODDIR/bin/acc_ctl" _restart_locked
+  "$ACC_LOCK_TOOL" timeout 35 "$ACC_LOCK_TOOL" flock "$LIFECYCLE_LOCK" sh "$MODDIR/bin/acc_ctl" _restart_locked
 }
 do_restart_locked() {
   if acc_running; then
     # 先固化身份：acc_running 每轮都会重写 ACC_PID/ACC_START/ACC_BOOT
     _rp=$ACC_PID; _rs=$ACC_START; _rb=$ACC_BOOT
-    : > "$DATA_DIR/.stop" || return 1
+    : > "$STOP_FILE" || return 1
     i=0
     while acc_running; do
       if [ "$i" -eq 10 ]; then
@@ -572,7 +582,7 @@ do_interval() {
   [ "$s" -lt 1 ] && s=1
   [ "$s" -gt 3600 ] && s=3600
 
-  mkdir -p "$DATA_DIR"
+  acc_init_layout
   conf=$DATA_DIR/settings.conf
   tmp=$conf.tmp.$$
   if [ -f "$conf" ]; then
@@ -593,9 +603,9 @@ do_scan_list() { scan_services; }
 
 # 统一串行化启动；点检过程与后台修复通过 --once 共用 work lock。
 do_ensure() {
-  mkdir -p "$DATA_DIR" || return 1
+  acc_init_layout || return 1
   acc_lock_init || { echo "启动失败：缺少可用的 busybox flock"; return 1; }
-  "$ACC_LOCK_TOOL" timeout 18 "$ACC_LOCK_TOOL" flock "$DATA_DIR/.lifecycle.lock" sh "$MODDIR/bin/acc_ctl" _ensure_locked
+  "$ACC_LOCK_TOOL" timeout 18 "$ACC_LOCK_TOOL" flock "$LIFECYCLE_LOCK" sh "$MODDIR/bin/acc_ctl" _ensure_locked
 }
 do_ensure_locked() {
   if acc_ensure_started; then
@@ -703,7 +713,7 @@ do_dump() {
   if acc_running; then echo "H|daemon|1"; else echo "H|daemon|0"; fi
   echo "H|enabled|$_ae"
   echo "H|paused|$(cat "$PAUSE_FILE" 2>/dev/null || echo 0)"
-  _fx=$(cat "$DATA_DIR/fixes.count" 2>/dev/null)
+  _fx=$(cat "$FIXES_FILE" 2>/dev/null)
   case "$_fx" in ''|*[!0-9]*) _fx=0 ;; esac
   echo "H|fixes|$_fx"
   echo "H|ver|$(sed -n 's/^version=//p' "$MODDIR/module.prop" 2>/dev/null | head -n 1)"
@@ -747,9 +757,9 @@ do_target_locked() {
   esac
 }
 do_target_serial() {
-  mkdir -p "$DATA_DIR" || return 1
+  acc_init_layout || return 1
   acc_lock_init || { echo "无法取得目标修改锁"; return 1; }
-  "$ACC_LOCK_TOOL" flock "$DATA_DIR/.work.lock" sh "$MODDIR/bin/acc_ctl" _target_locked "$@"
+  "$ACC_LOCK_TOOL" flock "$WORK_LOCK" sh "$MODDIR/bin/acc_ctl" _target_locked "$@"
 }
 
 cmd=$1

@@ -1,5 +1,37 @@
 # acc_keeper 的进程身份和文件锁。由 acc_ctl / acc_keeper.sh source。
 # 始终用 boot_id + /proc 起始时刻 + 精确 argv 校验，禁止按未经验证的 PID 发信号。
+
+# ---------------------------------------------------------------- 数据目录布局
+# 根目录只保留用户文件：settings.conf / targets.txt
+#   logs/   当前开机周期的日志（设备重启时清空重建）
+#   state/  pid、计数、上次退出、失败节流、拒绝名单、暂停与 stop 标记
+#   locks/  flock 锁文件
+ACC_LOG_DIR=$DATA_DIR/logs
+ACC_STATE_DIR=$DATA_DIR/state
+ACC_LOCK_DIR=$DATA_DIR/locks
+
+# 建目录并把旧版平铺布局搬到新位置。幂等：旧文件不在就什么都不做。
+acc_init_layout() {
+  # 运行时目录只给 root：默认 umask 可能是 000，mkdir 会建出 777
+  _acc_old_umask=$(umask)
+  umask 077
+  mkdir -p "$ACC_LOG_DIR" "$ACC_STATE_DIR" "$ACC_LOCK_DIR" 2>/dev/null || { umask "$_acc_old_umask"; return 1; }
+  chmod 700 "$ACC_LOG_DIR" "$ACC_STATE_DIR" "$ACC_LOCK_DIR" 2>/dev/null
+  umask "$_acc_old_umask"
+  [ -f "$DATA_DIR/acc_keeper.log" ] && mv -f "$DATA_DIR/acc_keeper.log" "$ACC_LOG_DIR/acc_keeper.log" 2>/dev/null
+  for acc_lf in daemon.pid last_good ticks.count fixes.count rejected.txt paused; do
+    [ -f "$DATA_DIR/$acc_lf" ] && mv -f "$DATA_DIR/$acc_lf" "$ACC_STATE_DIR/$acc_lf" 2>/dev/null
+  done
+  [ -f "$DATA_DIR/.last_boot" ] && mv -f "$DATA_DIR/.last_boot" "$ACC_STATE_DIR/last_boot" 2>/dev/null
+  [ -f "$DATA_DIR/.last_exit" ] && mv -f "$DATA_DIR/.last_exit" "$ACC_STATE_DIR/last_exit" 2>/dev/null
+  [ -f "$DATA_DIR/.last_fail" ] && mv -f "$DATA_DIR/.last_fail" "$ACC_STATE_DIR/last_fail" 2>/dev/null
+  [ -f "$DATA_DIR/.stop" ] && mv -f "$DATA_DIR/.stop" "$ACC_STATE_DIR/stop" 2>/dev/null
+  for acc_lk in daemon work lifecycle; do
+    [ -f "$DATA_DIR/.$acc_lk.lock" ] && mv -f "$DATA_DIR/.$acc_lk.lock" "$ACC_LOCK_DIR/$acc_lk.lock" 2>/dev/null
+  done
+  return 0
+}
+
 ACC_LOCK_TOOL=
 acc_lock_init() {
   [ -n "$ACC_LOCK_TOOL" ] && return 0
@@ -11,7 +43,7 @@ acc_lock_init() {
       [ -x "$acc_lt" ] || continue
     fi
     # 能力探测独立命名，避免并发请求误判 busybox 不支持 flock。
-    acc_probe="$DATA_DIR/.flock-probe.$$"
+    acc_probe="$ACC_LOCK_DIR/.flock-probe.$$"
     if "$acc_lt" flock -n "$acc_probe" true 2>/dev/null; then
       rm -f "$acc_probe" 2>/dev/null
       ACC_LOCK_TOOL=$acc_lt
@@ -141,7 +173,7 @@ acc_ensure_started() {
   # _ensure_locked 是独立 shell，父进程选定的变量不会自动继承。
   acc_lock_init || return 1
   ACC_START_RESULT=already
-  if acc_running && [ ! -e "$DATA_DIR/.stop" ]; then return 0; fi
+  if acc_running && [ ! -e "$ACC_STATE_DIR/stop" ]; then return 0; fi
   if acc_running; then
     acc_tries=0
     while acc_running; do
@@ -151,18 +183,18 @@ acc_ensure_started() {
   fi
   # 等旧 flock wrapper 完整退出，不在此处清除 .stop；PID 不可作为锁的替代。
   acc_tries=0
-  while ! "$ACC_LOCK_TOOL" flock -n "$DATA_DIR/.daemon.lock" true 2>/dev/null; do
+  while ! "$ACC_LOCK_TOOL" flock -n "$ACC_LOCK_DIR/daemon.lock" true 2>/dev/null; do
     [ "$acc_tries" -ge 40 ] && return 1
     sleep 0.2; acc_tries=$((acc_tries + 1))
   done
   # 启动子进程先关闭 lifecycle FD，再 exec，避免额外常驻 shell 或泄漏锁。
   (
-    acc_close_lock_fd "$DATA_DIR/.lifecycle.lock" || exit 1
+    acc_close_lock_fd "$ACC_LOCK_DIR/lifecycle.lock" || exit 1
     exec sh "$MODDIR/bin/acc_keeper.sh"
   ) </dev/null >/dev/null 2>&1 &
   acc_tries=0
   while [ "$acc_tries" -lt 50 ]; do
-    if acc_running && [ ! -e "$DATA_DIR/.stop" ]; then
+    if acc_running && [ ! -e "$ACC_STATE_DIR/stop" ]; then
       ACC_START_RESULT=started
       return 0
     fi

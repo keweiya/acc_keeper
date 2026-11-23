@@ -998,7 +998,9 @@ $(".js-menu-about").addEventListener("click", async function(){
     "系统或安全中心把它关掉后自动恢复，并记录每次被关的时间与组件。\n\n" +
     "守护列表: /data/adb/acc_keeper/targets.txt\n" +
     "参数: /data/adb/acc_keeper/settings.conf\n" +
-    "日志: /data/adb/acc_keeper/acc_keeper.log\n\n" +
+    "日志: /data/adb/acc_keeper/logs/acc_keeper.log（每次重启清空）\n" +
+    "状态: /data/adb/acc_keeper/state/\n" +
+    "锁: /data/adb/acc_keeper/locks/\n\n" +
     "命令行: su -c acc_ctl status";
 });
 

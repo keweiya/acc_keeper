@@ -9,22 +9,33 @@
 export PATH=/system/bin:/system/xbin:/vendor/bin:/data/adb/ksu/bin:/data/adb/magisk:/data/adb/ap/bin:$PATH
 
 DATA_DIR=${ACC_KEEPER_DATA_DIR:-/data/adb/acc_keeper}
+# 目录分层：根目录只留 settings.conf / targets.txt
+LOG_DIR=$DATA_DIR/logs
+STATE_DIR=$DATA_DIR/state
+LOCK_DIR=$DATA_DIR/locks
 TARGETS_FILE=$DATA_DIR/targets.txt
 CONF_FILE=$DATA_DIR/settings.conf
-LOG_FILE=$DATA_DIR/acc_keeper.log
-STATE_FILE=$DATA_DIR/last_good
-PAUSE_FILE=$DATA_DIR/paused
-REJECTED_FILE=$DATA_DIR/rejected.txt
-FIXES_FILE=$DATA_DIR/fixes.count
-PID_FILE=$DATA_DIR/daemon.pid
-TICKS_FILE=$DATA_DIR/ticks.count     # 累计检查次数（跨重启）
-BOOT_STATE_FILE=$DATA_DIR/.last_boot # 上次记录到的 boot_id，用来区分"设备重启"和"进程重启"
-LAST_EXIT_FILE=$DATA_DIR/.last_exit  # 上一次守护退出的摘要
+LOG_FILE=$LOG_DIR/acc_keeper.log
+STATE_FILE=$STATE_DIR/last_good
+PAUSE_FILE=$STATE_DIR/paused
+REJECTED_FILE=$STATE_DIR/rejected.txt
+FIXES_FILE=$STATE_DIR/fixes.count
+PID_FILE=$STATE_DIR/daemon.pid
+TICKS_FILE=$STATE_DIR/ticks.count     # 累计检查次数（跨重启）
+BOOT_STATE_FILE=$STATE_DIR/last_boot  # 上次记录到的 boot_id，用来区分"设备重启"和"进程重启"
+LAST_EXIT_FILE=$STATE_DIR/last_exit   # 上一次守护退出的摘要
+FAIL_FILE=$STATE_DIR/last_fail        # 失败节流的签名与时间戳
+STOP_FILE=$STATE_DIR/stop             # restart / 卸载时的停止标记
+DAEMON_LOCK=$LOCK_DIR/daemon.lock
+WORK_LOCK=$LOCK_DIR/work.lock
+LIFECYCLE_LOCK=$LOCK_DIR/lifecycle.lock
 MAXLOG=1048576        # 日志上限 1MB，超过就滚动保留后半段
 
 MODDIR=${MODDIR:-${ACC_KEEPER_MODDIR:-/data/adb/modules/acc_keeper}}
 [ -r "$MODDIR/bin/acc_runtime.sh" ] || exit 1
 . "$MODDIR/bin/acc_runtime.sh"
+# 建目录并完成旧布局迁移（根目录只留 settings.conf / targets.txt）
+acc_init_layout || exit 1
 ACC_VERSION=$(sed -n 's/^version=//p' "$MODDIR/module.prop" 2>/dev/null | head -n 1)
 [ -n "$ACC_VERSION" ] || ACC_VERSION="unknown"
 
@@ -39,7 +50,7 @@ STRICT=0               # 兼容旧配置；修复时始终保留非目标服务
 HEARTBEAT_SECONDS=1800 # 心跳日志间隔（秒）；0 = 关闭
 SLOW_TICK_MS=3000      # 单轮检查超过多少毫秒额外记一条日志
 
-[ -d "$DATA_DIR" ] || mkdir -p "$DATA_DIR" 2>/dev/null
+mkdir -p "$LOG_DIR" "$STATE_DIR" "$LOCK_DIR" 2>/dev/null
 if [ -f "$CONF_FILE" ]; then . "$CONF_FILE"; fi
 # 配置写错也不能让守护死掉：非数字一律回落到默认值
 for _v in POLL_FAST POLL_SLOW BOOT_FAST_SECONDS BOOST_TICKS HEARTBEAT_SECONDS SLOW_TICK_MS; do
@@ -61,7 +72,8 @@ done
 
 # ---------------------------------------------------------------- 日志
 log() {
-  ts=$(date '+%Y-%m-%d %H:%M:%S')
+  ts=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+  [ -n "$ts" ] || ts="时间未知"
   echo "[$ts] $*" >> "$LOG_FILE" 2>/dev/null
   sz=$(wc -c < "$LOG_FILE" 2>/dev/null)
   if [ "${sz:-0}" -gt "$MAXLOG" ]; then
@@ -246,7 +258,7 @@ settings_put() { settings put secure "$1" "$2" 2>/dev/null; }
 wait_ready() {
   i=0
   while [ $i -lt 90 ]; do
-    [ -e "$DATA_DIR/.stop" ] && return 1
+    [ -e "$STOP_FILE" ] && return 1
     if read_settings; then return 0; fi
     sleep 1; i=$((i + 1))
   done
@@ -302,6 +314,8 @@ apply_once() {
   done
 
   if [ -z "$missing" ] && [ "$AE" = "1" ]; then
+    # 状态正常：顺手清掉可能残留的失败节流记录（上次失败后来自己好了的情况）
+    [ -f "$FAIL_FILE" ] && rm -f "$FAIL_FILE" 2>/dev/null
     return 0
   fi
 
@@ -317,7 +331,8 @@ apply_once() {
   if [ -n "$missing" ]; then
     mcnt=$(printf '%s\n' $missing | grep -c .)
     msample=$(printf '%s\n' $missing | head -n 3 | tr '\n' ' ')
-    [ "$VERBOSE" = "1" ] && log "→ 恢复服务 ${mcnt} 个: ${msample}"
+    # 先读后写：这里只补写掉线的这几个，其余在线服务原样保留
+    log "→ 只补写掉线的 ${mcnt} 个: ${msample}（保留其他 $(count_lines "$cur") 项）"
     [ "$VERBOSE" = "1" ] && log "· 写入前列表($(count_lines "$cur") 项): ${EAS:-(空)}"
   else
     [ "$VERBOSE" = "1" ] && log "→ 总开关 accessibility_enabled=1（当前 $AE）"
@@ -333,20 +348,44 @@ apply_once() {
   fi
   sleep "$VERIFY_SLEEP"
   # ---- 校验 ----
+  # 开机早期 AccessibilityManagerService 还没把总开关落盘，写完立刻读回会拿到旧值：
+  # 常见现象是服务列表 5 项都写进去了，但 accessibility_enabled 仍读回 0。这不是故障。
+  # 所以开机早期多等一轮重读，两轮都读不到才算真失败。
+  _boot_up=${ACC_FAKE_UPTIME:-$(cut -d. -f1 /proc/uptime 2>/dev/null)}
+  case "$_boot_up" in ''|*[!0-9]*) _boot_up=999999 ;; esac
+  _early=0
+  [ "$_boot_up" -lt "$BOOT_FAST_SECONDS" ] && _early=1
+
+  VSTATE=""
+  verify_state() {
+    if ! read_settings; then VSTATE="unreadable"; return 1; fi
+    cur2=$(norm_list "$EAS")
+    bad=""
+    for t in $tgt; do
+      printf '%s\n' "$cur2" | grep -qxF "$t" || bad="$bad $t"
+    done
+    if [ -z "$bad" ] && [ "$AE" = "1" ]; then VSTATE="ok"; return 0; fi
+    VSTATE="pending"
+    return 1
+  }
+
   sleep 1
-  if ! read_settings; then
-    log "✗ 无法验证无障碍设置"
+  if ! verify_state; then
+    if [ "$_early" = "1" ]; then
+      sleep 2
+      verify_state || true
+    fi
+  fi
+
+  if [ "$VSTATE" = "unreadable" ]; then
+    log "✗ 无法验证无障碍设置（settings 读回失败）"
     return 1
   fi
-  cur2=$(norm_list "$EAS")
-  bad=""
-  for t in $tgt; do
-    printf '%s\n' "$cur2" | grep -qxF "$t" || bad="$bad $t"
-  done
-  if [ -z "$bad" ] && [ "$AE" = "1" ]; then
+
+  if [ "$VSTATE" = "ok" ]; then
     _fix_ms=$(( $(now_ms) - _fix_t0 ))
     if [ "$mcnt" -gt 0 ]; then
-      log "✓ 已恢复 ${mcnt} 个（耗时 ${_fix_ms}ms，列表 $(count_lines "$cur2") 项）"
+      log "✓ 已激活 ${mcnt} 个（耗时 ${_fix_ms}ms，列表 $(count_lines "$cur2") 项）: ${msample}"
     else
       log "✓ 总开关已恢复（耗时 ${_fix_ms}ms）"
     fi
@@ -354,7 +393,7 @@ apply_once() {
     bump_fixes
     if [ -n "$tgt" ]; then printf '%s\n' $tgt > "$STATE_FILE" 2>/dev/null; else : > "$STATE_FILE"; fi
     FIXED=1
-    rm -f "$DATA_DIR/.last_fail" 2>/dev/null
+    rm -f "$FAIL_FILE" 2>/dev/null
     # 写成功了：把目标从"系统拒绝"名单里摘掉（应用更新后可能又能用了）
     if [ -s "$REJECTED_FILE" ]; then
       _rt="$REJECTED_FILE.tmp.$$"
@@ -366,20 +405,29 @@ apply_once() {
       mv -f "$_rt" "$REJECTED_FILE"
     fi
   else
+    # 开机早期系统自己还在初始化：不是故障，不记失败、不写拒绝名单，下一轮重试即可
+    if [ "$_early" = "1" ]; then
+      log "· 开机早期设置未落盘（读回 AE=${AE:-?} / 列表 $(count_lines "$cur2") 项），下一轮重试"
+      return 1
+    fi
     # 同一种失败 10 分钟内只记一次，免得日志被刷爆
     sig=$(printf '%s\n' $bad | sort -u | tr '\n' ',')
     nowt=$(date +%s)
     lf=""; lt=0
-    if [ -f "$DATA_DIR/.last_fail" ]; then
-      lf=$(sed -n '1p' "$DATA_DIR/.last_fail" 2>/dev/null)
-      lt=$(sed -n '2p' "$DATA_DIR/.last_fail" 2>/dev/null)
+    if [ -f "$FAIL_FILE" ]; then
+      lf=$(sed -n '1p' "$FAIL_FILE" 2>/dev/null)
+      lt=$(sed -n '2p' "$FAIL_FILE" 2>/dev/null)
     fi
     case "$lt" in ''|*[!0-9]*) lt=0 ;; esac
     if [ "$sig" != "$lf" ] || [ $((nowt - lt)) -gt 600 ]; then
       bcnt=$(printf '%s\n' $bad | grep -c .)
       bsample=$(printf '%s\n' $bad | head -n 2 | tr '\n' ' ')
-      log "✗ 恢复失败 ${bcnt} 个（未生效）: ${bsample} —— 读回 AE=$AE / 列表 $(count_lines "$cur2") 项；组件可能已不存在，试 su -c acc_ctl clean"
-      printf '%s\n%s\n' "$sig" "$nowt" > "$DATA_DIR/.last_fail" 2>/dev/null
+      if [ "$bcnt" -gt 0 ]; then
+        log "✗ 恢复失败 ${bcnt} 个（未生效）: ${bsample} —— 读回 AE=${AE:-?} / 列表 $(count_lines "$cur2") 项；组件可能已不存在，试 su -c acc_ctl clean"
+      else
+        log "✗ 服务列表已写对，但总开关未生效（读回 AE=${AE:-?} / 列表 $(count_lines "$cur2") 项）"
+      fi
+      printf '%s\n%s\n' "$sig" "$nowt" > "$FAIL_FILE" 2>/dev/null
       # 记进"系统拒绝"名单：以后不再尝试、界面标灰，免得每轮白写一次
       for _b in $bad; do
         grep -qxF "$_b" "$REJECTED_FILE" 2>/dev/null || printf '%s\n' "$_b" >> "$REJECTED_FILE"
@@ -400,7 +448,7 @@ if [ "$1" = "--desc" ]; then
 fi
 if [ "$1" = "--once" ]; then
   acc_lock_init || { log "✗ 无可用 flock，无法检查"; exit 1; }
-  exec "$ACC_LOCK_TOOL" flock "$DATA_DIR/.work.lock" sh "$MODDIR/bin/acc_keeper.sh" --locked-once "$2"
+  exec "$ACC_LOCK_TOOL" flock "$WORK_LOCK" sh "$MODDIR/bin/acc_keeper.sh" --locked-once "$2"
 fi
 if [ "$1" = "--locked-once" ]; then
   if [ "$2" = "--fast" ]; then VERIFY_SLEEP=0.3; fi
@@ -414,23 +462,35 @@ fi
 # 只有 busybox flock 包装器可进入 --daemon 模式；锁由内核在进程结束后释放。
 if [ "$1" != "--daemon" ]; then
   acc_lock_init || { log "✗ 无可用 busybox flock，拒绝无锁启动"; exit 1; }
-  exec "$ACC_LOCK_TOOL" flock -n "$DATA_DIR/.daemon.lock" sh "$MODDIR/bin/acc_keeper.sh" --daemon
+  exec "$ACC_LOCK_TOOL" flock -n "$DAEMON_LOCK" sh "$MODDIR/bin/acc_keeper.sh" --daemon
 fi
 # flock 父进程持锁；关闭 daemon 自己持有的描述符，避免子命令继承。
-acc_close_lock_fd "$DATA_DIR/.daemon.lock" || exit 1
+acc_close_lock_fd "$DAEMON_LOCK" || exit 1
 # 此时已经持有常驻锁。旧标记只有在锁内才能清理。
-rm -f "$DATA_DIR/.stop" 2>/dev/null
+rm -f "$STOP_FILE" 2>/dev/null
 start_ts=$(date +%s)
 TICKS=$(read_ticks)
 EXIT_REASON="正常结束"
+
+# 设备重启（boot_id 变了）→ 删掉上一轮的日志，本轮重新生成。
+# 同一 boot_id 内的进程重启继续追加，方便排查多次重启的链路。
+_prev_boot=$(cat "$BOOT_STATE_FILE" 2>/dev/null)
+_cur_boot=$(boot_id_now)
+if [ -z "$_prev_boot" ] || [ "$_cur_boot" != "$_prev_boot" ]; then
+  rm -f "$LOG_DIR"/*.log "$LOG_DIR"/*.log.* 2>/dev/null
+  : > "$LOG_FILE"
+  printf '%s\n' "$_cur_boot" > "$BOOT_STATE_FILE"
+fi
+
 log "=== 守护启动 ${ACC_VERSION} (pid $$) ==="
 acc_write_identity || { log "✗ 无法建立守护进程身份（cmdline 不匹配或 /proc 不可读）"; exit 1; }
 chmod 600 "$PID_FILE" "$LOG_FILE" "$STATE_FILE" "$REJECTED_FILE" "$TARGETS_FILE" 2>/dev/null
 
 # ---- 启动摘要：设备重启 / 进程重启、配置、目标，一次看全
 log_startup() {
-  _cur_boot=$(boot_id_now)
-  _prev_boot=$(cat "$BOOT_STATE_FILE" 2>/dev/null)
+  # boot_id 与清日志时算好的一致，沿用同一组值判断"设备重启 / 进程重启"
+  _cur_boot=${_cur_boot:-$(boot_id_now)}
+  _prev_boot=${_prev_boot-}
   _up=$(cut -d. -f1 /proc/uptime 2>/dev/null)
   log "· 设备 $(getprop ro.product.model 2>/dev/null) / Android $(getprop ro.build.version.release 2>/dev/null) / 内核 $(uname -r 2>/dev/null)"
   log "· boot_id=${_cur_boot:-未知} 已开机 $(fmt_dur "${_up:-0}")"
@@ -448,11 +508,21 @@ log_startup() {
 }
 
 acc_exit() {
-  _now=$(date +%s)
+  # 设备重启时 init/KernelSU 会直接回收进程，日期和子命令可能执行失败：
+  # 这里全部做兜底，避免日志出现 "[] --- 守护退出 ... 运行= 修复=" 这种空字段。
+  _now=$(date +%s 2>/dev/null)
+  case "$_now" in ''|*[!0-9]*) _now=$start_ts ;; esac
   _dur=$((_now - start_ts))
-  log "--- 守护退出 pid=$$ 原因=${EXIT_REASON} 运行=$(fmt_dur "$_dur") 累计检查=${TICKS} 修复=$(read_fixes)"
+  [ "$_dur" -ge 0 ] || _dur=0
+  _dtxt=$(fmt_dur "$_dur" 2>/dev/null)
+  [ -n "$_dtxt" ] || _dtxt="未知"
+  _ftxt=$(read_fixes 2>/dev/null)
+  [ -n "$_ftxt" ] || _ftxt="?"
+  _tsx=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+  [ -n "$_tsx" ] || _tsx="时间未知"
+  log "--- 守护退出 pid=$$ 原因=${EXIT_REASON:-未知} 运行=${_dtxt} 累计检查=${TICKS:-?} 修复=${_ftxt}"
   printf 'pid=%s 时间=%s 运行=%s 检查=%s 修复=%s 原因=%s boot_id=%s\n' \
-    "$$" "$(date '+%Y-%m-%d %H:%M:%S')" "$(fmt_dur "$_dur")" "${TICKS:-0}" "$(read_fixes)" "$EXIT_REASON" "$(boot_id_now)" \
+    "$$" "$_tsx" "$_dtxt" "${TICKS:-0}" "$_ftxt" "${EXIT_REASON:-未知}" "$(boot_id_now)" \
     > "$LAST_EXIT_FILE" 2>/dev/null
   acc_cleanup_identity
   update_desc
@@ -479,13 +549,13 @@ nap() {
   # 熄屏时系统会每 5 秒 suspend/resume 一次（冻结/解冻全部进程），
   # suspend-service 长期占 CPU，待机耗电明显变高。
   # 需要立刻停止/重启时，acc_ctl 校验进程身份后发 SIGTERM，trap 立即接管。
-  if [ -e "$DATA_DIR/.stop" ]; then EXIT_REASON="检测到 .stop 标记"; exit 0; fi
+  if [ -e "$STOP_FILE" ]; then EXIT_REASON="检测到停止标记"; exit 0; fi
   sleep "$_n"
-  if [ -e "$DATA_DIR/.stop" ]; then EXIT_REASON="检测到 .stop 标记"; exit 0; fi
+  if [ -e "$STOP_FILE" ]; then EXIT_REASON="检测到停止标记"; exit 0; fi
 }
 
 while :; do
-  [ -e "$DATA_DIR/.stop" ] && { EXIT_REASON="检测到 .stop 标记"; break; }
+  [ -e "$STOP_FILE" ] && { EXIT_REASON="检测到停止标记"; break; }
 
   if acc_is_paused; then
     if [ "$PAUSE_LOGGED" = "0" ]; then

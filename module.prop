@@ -1,6 +1,6 @@
 id=acc_keeper
 name=无障碍守护
-version=v1.22.0
-versionCode=22200
+version=v1.23.0
+versionCode=22300
 author=keweiya
 description=开机自动启用并持续守护选定的无障碍服务，被系统或省电策略关闭后自动恢复
