@@ -5,12 +5,15 @@
 # ==========================================================
 MODDIR=${0%/*}
 [ -d "$MODDIR" ] || MODDIR=/data/adb/modules/acc_keeper
+export ACC_KEEPER_DATA_DIR=/data/adb/acc_keeper
+export ACC_KEEPER_MODDIR="$MODDIR"
 
 echo "无障碍守护 · 立即检查"
 echo "------------------------"
 
 if [ -f "$MODDIR/bin/acc_ctl" ]; then
-  /system/bin/sh "$MODDIR/bin/acc_ctl" check
+  ACC_KEEPER_MODDIR="$MODDIR" /system/bin/sh "$MODDIR/bin/acc_ctl" check
 else
   echo "模块文件不完整：找不到 bin/acc_ctl"
+  exit 1
 fi

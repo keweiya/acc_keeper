@@ -26,9 +26,10 @@ fi
 
 chmod 755 "$MODPATH/service.sh" "$MODPATH/post-fs-data.sh" "$MODPATH/uninstall.sh" "$MODPATH/action.sh" 2>/dev/null
 chmod 755 "$MODPATH/bin/acc_keeper.sh" "$MODPATH/bin/acc_ctl" 2>/dev/null
+chmod 644 "$MODPATH/bin/acc_runtime.sh" 2>/dev/null
 chmod 755 "$MODPATH/system/bin/acc_ctl" 2>/dev/null
 chmod 644 "$DATA_DIR/targets.txt" "$DATA_DIR/settings.conf" 2>/dev/null
 
 ui_print "- 配置目录: /data/adb/acc_keeper"
-ui_print "- 重启后守护进程自动启动"
+ui_print "- 重启后守护进程自动启动；点检或 Action 也会检查并拉起"
 ui_print "- 配置方法: su -c acc_ctl scan / add <包名>"

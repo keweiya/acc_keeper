@@ -5,18 +5,25 @@
 # ==========================================================================
 export PATH=/system/bin:/system/xbin:/vendor/bin:/data/adb/ksu/bin:/data/adb/magisk:$PATH
 
-DATA_DIR=/data/adb/acc_keeper
+DATA_DIR=${ACC_KEEPER_DATA_DIR:-/data/adb/acc_keeper}
 TARGETS_FILE=$DATA_DIR/targets.txt
 LOG_FILE=$DATA_DIR/acc_keeper.log
 PID_FILE=$DATA_DIR/daemon.pid
 PAUSE_FILE=$DATA_DIR/paused
 REJECTED_FILE=$DATA_DIR/rejected.txt
 
-MODDIR=
-for d in /data/adb/modules/acc_keeper /data/adb/modules_update/acc_keeper; do
-  if [ -f "$d/module.prop" ]; then MODDIR=$d; break; fi
-done
-[ -z "$MODDIR" ] && MODDIR=/data/adb/modules/acc_keeper
+if [ -n "${ACC_KEEPER_MODDIR:-}" ]; then
+  MODDIR=$ACC_KEEPER_MODDIR
+else
+  MODDIR=
+  for d in /data/adb/modules/acc_keeper /data/adb/modules_update/acc_keeper; do
+    if [ -f "$d/module.prop" ]; then MODDIR=$d; break; fi
+  done
+  [ -z "$MODDIR" ] && MODDIR=/data/adb/modules/acc_keeper
+fi
+[ -r "$MODDIR/bin/acc_runtime.sh" ] || { echo "模块缺少进程身份辅助脚本" >&2; exit 1; }
+export MODDIR
+. "$MODDIR/bin/acc_runtime.sh"
 
 # ------------------------------------------------- 工具函数
 # 让 module.prop 里的 description 跟上当前状态（KernelSU 模块卡片显示的就是它）
@@ -194,13 +201,14 @@ acc_ctl —— 无障碍服务守护控制
   su -c acc_ctl on <包名>               开启该应用的无障碍服务（= 加守护 + 立即启用）
   su -c acc_ctl off <包名>              关闭该应用的无障碍服务（= 取消守护 + 立即禁用）
   su -c acc_ctl apply                   立即检查并修复一次
+  su -c acc_ctl check                   点检；必要时启动守护进程
   su -c acc_ctl status                  总览：系统值 / 守护进程 / 最近日志
   su -c acc_ctl log [行数]              查看变更日志（默认 30 行）
   su -c acc_ctl pause [分钟]            暂停守护（默认 30 分钟）
   su -c acc_ctl resume                  立即恢复守护
   su -c acc_ctl interval <快> <慢>      设置轮询间隔（秒）并重启守护进程
   su -c acc_ctl restart                 重启守护进程（让 settings.conf 生效）
-  su -c acc_ctl adopt                   把系统里已开启的无障碍服务全部纳入守护
+  su -c acc_ctl adopt                   已禁用自动纳入，使用 add 手动选择目标
   su -c acc_ctl upgrade [zip]           热更新：覆盖模块文件并重启守护，不用重装/重启设备
   su -c acc_ctl clean                   清掉守护列表里已不存在的组件（自动备份）
   su -c acc_ctl packages                列出已安装包名
@@ -269,7 +277,7 @@ do_add() {
     echo "已加入守护: $comp"
   fi
   echo "--- 立即应用 ---"
-  sh "$MODDIR/bin/acc_keeper.sh" --once
+  sh "$MODDIR/bin/acc_keeper.sh" --locked-once
   tail -n 3 "$LOG_FILE" 2>/dev/null | sed 's/^/  /'
 }
 
@@ -334,27 +342,9 @@ do_packages() {
 
 # 把"系统里已经开着"的无障碍服务纳入守护（默认全部守护）
 do_adopt() {
-  list=$(scan_services)
-  if [ -z "$list" ]; then
-    echo "扫描不到无障碍服务，跳过"
-    return 1
-  fi
-  cur=$(norm_list "$(settings get secure enabled_accessibility_services 2>/dev/null)")
-  mkdir -p "$DATA_DIR"; touch "$TARGETS_FILE"
-  added=0
-  for c in $cur; do
-    printf "%s\n" "$list" | grep -qxF "$c" || continue
-    is_rejected "$c" && continue
-    grep -qxF "$c" "$TARGETS_FILE" && continue
-    printf '%s\n' "$c" >> "$TARGETS_FILE"
-    added=$((added + 1))
-  done
-  if [ "$added" -gt 0 ]; then
-    refresh_desc
-    echo "已纳入 $added 个已启用的服务"
-  else
-    echo "没有需要纳入的服务"
-  fi
+  # 旧 WebUI 每次载入自动调用 adopt，无法区分显式请求；不能隐式改变用户选择。
+  echo "已禁用自动纳入；请使用 acc_ctl add 或 WebUI 开关选择要守护的服务"
+  return 0
 }
 
 # 清洗守护列表：把"已经不存在于本机"的组件删掉（跨块配对 bug 留下的垃圾）
@@ -383,7 +373,7 @@ do_clean() {
   mv -f "$tmp" "$TARGETS_FILE"
   echo "清理完成：保留 $kept 条，移除 $dropped 条不存在的组件"
   refresh_desc
-  sh "$MODDIR/bin/acc_keeper.sh" --once >/dev/null 2>&1
+  sh "$MODDIR/bin/acc_keeper.sh" --locked-once >/dev/null 2>&1
   tail -n 4 "$LOG_FILE" 2>/dev/null | sed 's/^/  /'
 }
 
@@ -416,7 +406,16 @@ do_on() {
   for c in $usable; do
     grep -qxF "$c" "$TARGETS_FILE" || echo "$c" >> "$TARGETS_FILE"
   done
-  sh "$MODDIR/bin/acc_keeper.sh" --once --fast
+  sh "$MODDIR/bin/acc_keeper.sh" --locked-once --fast
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    echo "已加入目标，但守护已暂停；恢复后才会修复"
+    return 2
+  fi
+  if [ "$rc" -ne 0 ]; then
+    echo "已加入目标，但启用或校验失败，请检查日志"
+    return 1
+  fi
   echo "OK"
 }
 
@@ -424,11 +423,40 @@ do_on() {
 do_off() {
   pkg=$1
   [ -z "$pkg" ] && { echo "用法: acc_ctl off <包名>"; return 1; }
+  raw=$(settings get secure enabled_accessibility_services 2>/dev/null) || { echo "读取系统服务失败，未修改"; return 1; }
+  case "$raw" in *Error*|*Exception*) echo "读取系统服务失败，未修改"; return 1 ;; esac
+  case "$raw" in ''|null|NULL|Null) ;; *)
+    if ! printf '%s\n' "$raw" | tr ':' '\n' | while IFS= read -r entry || [ -n "$entry" ]; do
+      [ -z "$entry" ] && continue
+      case "$entry" in *[!A-Za-z0-9_.$/]*) exit 1 ;; esac
+      norm_one "$entry" >/dev/null || exit 1
+    done; then echo "系统列表格式异常，未修改"; return 1; fi ;;
+  esac
+  # 非目标条目原样保留，不规范化或排序。
+  case "$raw" in ''|null|NULL|Null) new_val="" ;;
+    *)
+      new_val=""
+      oldifs=$IFS; IFS=:
+      for comp in $raw; do
+        case "$comp" in "$pkg"/*) continue ;; esac
+        if [ -n "$new_val" ]; then new_val="$new_val:$comp"; else new_val=$comp; fi
+      done
+      IFS=$oldifs ;;
+  esac
+  if ! settings put secure enabled_accessibility_services "$new_val" 2>/dev/null; then
+    echo "关闭失败，系统设置写入失败；目标未移除"
+    return 1
+  fi
+  after=$(settings get secure enabled_accessibility_services 2>/dev/null) || { echo "写入后无法验证，目标未移除"; return 1; }
+  case "$after" in *Error*|*Exception*) echo "写入后无法验证，目标未移除"; return 1 ;; esac
+  # 系统可以规范化组件，按组件含义核对全部应保留项和已删除项。
+  after_norm=$(norm_list "$after")
+  expected_norm=$(norm_list "$new_val")
+  if [ "$after_norm" != "$expected_norm" ]; then
+    echo "关闭结果与预期不一致，目标未移除，请检查系统状态"
+    return 1
+  fi
   [ -f "$TARGETS_FILE" ] && _remove_target "$pkg" >/dev/null
-  cur=$(norm_list "$(settings get secure enabled_accessibility_services 2>/dev/null)")
-  keep=$(printf '%s\n' "$cur" | grep -v "^$pkg/" | grep -v '^$')
-  new_val=$(printf '%s\n' "$keep" | sed '/^$/d' | sort -u | tr '\n' ':' | sed 's/:$//')
-  settings put secure enabled_accessibility_services "$new_val" 2>/dev/null
   echo "OK"
   refresh_desc
 }
@@ -440,18 +468,30 @@ do_status() {
   echo "=========== 守护目标 ==========="
   do_list | sed 's/^/  /'
   echo
-  echo "=========== 系统当前 ==========="
-  echo "  accessibility_enabled = $(settings get secure accessibility_enabled 2>/dev/null)"
-  settings get secure enabled_accessibility_services 2>/dev/null | tr ':' '\n' | while IFS= read -r l; do
-    [ -n "$l" ] && [ "$l" != "null" ] && echo "  $l"
-  done
+  echo "=========== 目标当前状态 ==========="
+  _status_ae=$(settings get secure accessibility_enabled 2>/dev/null); _ae_rc=$?
+  _status_raw=$(settings get secure enabled_accessibility_services 2>/dev/null); _list_rc=$?
+  case "$_status_ae" in 0|1|null|NULL|Null) ;; *) _ae_rc=1 ;; esac
+  case "$_status_raw" in *Error*|*Exception*) _list_rc=1 ;; esac
+  if [ "$_ae_rc" -ne 0 ] || [ "$_list_rc" -ne 0 ]; then
+    echo "  系统状态未知（读取失败）"
+  else
+    echo "  accessibility_enabled = $_status_ae"
+    _status_cur=$(norm_list "$_status_raw")
+    for _status_t in $(read_targets_norm); do
+      if printf '%s\n' "$_status_cur" | grep -qxF "$_status_t"; then
+        echo "  已启用: $_status_t"
+      else
+        echo "  缺失: $_status_t"
+      fi
+    done
+  fi
   echo
   echo "=========== 守护进程 ==========="
-  pid=$(cat "$PID_FILE" 2>/dev/null)
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    echo "  运行中 (pid $pid)"
+  if acc_running; then
+    echo "  运行中 (pid $ACC_PID)"
   else
-    echo "  未运行（重启后由 service.sh 自动拉起；手动启动: sh $MODDIR/bin/acc_keeper.sh &）"
+    echo "  未运行（执行 acc_ctl check 可尝试启动）"
   fi
   [ -f "$PAUSE_FILE" ] && echo "  已暂停至: $(cat "$PAUSE_FILE" 2>/dev/null) (epoch)"
   echo
@@ -464,51 +504,61 @@ do_pause() {
   mins=${1:-30}
   case "$mins" in ''|*[!0-9]*) mins=30 ;; esac
   mkdir -p "$DATA_DIR"
-  echo $(( $(date +%s) + mins * 60 )) > "$PAUSE_FILE"
+  acc_lock_init || { echo "无法取得检查锁"; return 1; }
+  "$ACC_LOCK_TOOL" flock "$DATA_DIR/.work.lock" sh "$MODDIR/bin/acc_ctl" _pause_locked "$mins" || return 1
   echo "已暂停守护 $mins 分钟。恢复: acc_ctl resume"
   refresh_desc
 }
+do_pause_locked() {
+  mins=$1
+  case "$mins" in ''|*[!0-9]*) return 1 ;; esac
+  echo $(( $(date +%s) + mins * 60 )) > "$PAUSE_FILE"
+}
 
 do_resume() {
-  rm -f "$PAUSE_FILE"
+  mkdir -p "$DATA_DIR"
+  acc_lock_init || { echo "无法取得检查锁"; return 1; }
+  "$ACC_LOCK_TOOL" flock "$DATA_DIR/.work.lock" sh "$MODDIR/bin/acc_ctl" _resume_locked || return 1
   echo "已恢复守护"
   sh "$MODDIR/bin/acc_keeper.sh" --once
 }
+do_resume_locked() { rm -f "$PAUSE_FILE"; }
 
-# 重启守护进程（改完 settings.conf 后让新参数生效）
+# restart 和 check 的启动阶段串行；先校验进程身份再发信号，绝不按未验证的 PID 发。
 do_restart() {
-  # 跨 PID 命名空间时 kill 打不到别的会话起的进程（实测 kill 返回成功但进程还在），
-  # 所以用停止文件通知守护进程自己退出，再等它消失。
-  mkdir -p "$DATA_DIR" 2>/dev/null
-  : > "$DATA_DIR/.stop" 2>/dev/null
-
-  i=0
-  while [ $i -lt 30 ]; do
-    _alive=0
-    for _d in /proc/[0-9]*; do
-      _p=${_d#/proc/}
-      case "$_p" in "$$"|"$PPID") continue ;; esac
-      _cmd=$(tr '\0' ' ' < "$_d/cmdline" 2>/dev/null) || continue
-      case "$_cmd" in
-        "sh $MODDIR/bin/acc_keeper.sh"|"sh $MODDIR/bin/acc_keeper.sh "|\
-        "/system/bin/sh $MODDIR/bin/acc_keeper.sh"|"/system/bin/sh $MODDIR/bin/acc_keeper.sh ")
-          _alive=1; break ;;
-      esac
+  mkdir -p "$DATA_DIR" || return 1
+  acc_lock_init || { echo "无法取得启动锁"; return 1; }
+  "$ACC_LOCK_TOOL" timeout 35 "$ACC_LOCK_TOOL" flock "$DATA_DIR/.lifecycle.lock" sh "$MODDIR/bin/acc_ctl" _restart_locked
+}
+do_restart_locked() {
+  if acc_running; then
+    # 先固化身份：acc_running 每轮都会重写 ACC_PID/ACC_START/ACC_BOOT
+    _rp=$ACC_PID; _rs=$ACC_START; _rb=$ACC_BOOT
+    : > "$DATA_DIR/.stop" || return 1
+    i=0
+    while acc_running; do
+      if [ "$i" -eq 10 ]; then
+        # 常驻守护现在整段单次 sleep（避免把 60 秒切成 5 秒短唤醒拖累挂起），
+        # 只等 .stop 最坏要等一个轮询周期；校验身份后发 TERM 立即打断 sleep。
+        if acc_pid_identity "$_rp" "$_rs" "$_rb"; then
+          kill -TERM "$_rp" 2>/dev/null
+        fi
+      fi
+      if [ "$i" -ge 100 ]; then
+        echo "守护进程未在预期时间内退出，未强制终止或启动第二个实例"
+        return 1
+      fi
+      sleep 0.2; i=$((i + 1))
     done
-    [ "$_alive" = "0" ] && break
-    sleep 0.5
-    i=$((i + 1))
-  done
-
-  rm -f "$DATA_DIR/.stop" "$PID_FILE" 2>/dev/null
-  nohup sh "$MODDIR/bin/acc_keeper.sh" >/dev/null 2>&1 &
-  sleep 1
-  newpid=$(cat "$PID_FILE" 2>/dev/null)
-  if [ -n "$newpid" ] && kill -0 "$newpid" 2>/dev/null; then
-    echo "守护进程已重启 (pid $newpid)"
-  else
-    echo "重启失败，下次开机由 service.sh 拉起"
   fi
+  if acc_ensure_started; then
+    echo "守护进程已重启 (pid $ACC_PID)"
+    refresh_desc
+    return 0
+  fi
+  echo "重启失败，请检查日志与 flock 支持"
+  refresh_desc
+  return 1
 }
 
 # 设置轮询间隔：例如 acc_ctl interval 5 60
@@ -541,34 +591,84 @@ do_interval() {
 # 只输出组件名（守护进程校验用：本机已经不存在的组件要摘掉）
 do_scan_list() { scan_services; }
 
-# 立即检查：跑一轮 apply，然后打印几行结果（action.sh / 命令行用）
+# 统一串行化启动；点检过程与后台修复通过 --once 共用 work lock。
+do_ensure() {
+  mkdir -p "$DATA_DIR" || return 1
+  acc_lock_init || { echo "启动失败：缺少可用的 busybox flock"; return 1; }
+  "$ACC_LOCK_TOOL" timeout 18 "$ACC_LOCK_TOOL" flock "$DATA_DIR/.lifecycle.lock" sh "$MODDIR/bin/acc_ctl" _ensure_locked
+}
+do_ensure_locked() {
+  if acc_ensure_started; then
+    if [ "$ACC_START_RESULT" = started ]; then
+      echo "守护进程: 已启动 (pid $ACC_PID)"
+    else
+      echo "守护进程: 已运行 (pid $ACC_PID)"
+    fi
+    return 0
+  fi
+  echo "守护进程: 启动失败或身份无法验证"
+  return 1
+}
+
+# 目标缺失数；不把非目标的数量变化解释为恢复结果。
+count_missing() {
+  missing_n=0
+  for target in $1; do
+    printf '%s\n' "$2" | grep -qxF "$target" || missing_n=$((missing_n + 1))
+  done
+  printf '%s\n' "$missing_n"
+}
 do_check() {
+  do_ensure
+  start_rc=$?
+  refresh_desc
+  if [ "$start_rc" -ne 0 ]; then echo "结果: 启动失败，未执行点检"; return 1; fi
+
   tgt=$(read_targets_norm)
   appn=$(printf '%s\n' "$tgt" | sed 's#/.*##' | sort -u | grep -c .)
-  before=$(norm_list "$(settings get secure enabled_accessibility_services 2>/dev/null)")
-  b_n=$(printf '%s\n' "$before" | grep -c .)
-  b_ae=$(settings get secure accessibility_enabled 2>/dev/null)
-
-  sh "$MODDIR/bin/acc_keeper.sh" --once >/dev/null 2>&1
-
-  after=$(norm_list "$(settings get secure enabled_accessibility_services 2>/dev/null)")
-  a_n=$(printf '%s\n' "$after" | grep -c .)
-  a_ae=$(settings get secure accessibility_enabled 2>/dev/null)
-
-  echo "守护目标: ${appn} 个应用"
-  echo "系统启用: ${b_n} → ${a_n} 个无障碍服务"
-
-  if [ "$a_n" -gt "$b_n" ]; then
-    echo "结果: 已恢复 $((a_n - b_n)) 个服务"
-  elif [ "$b_ae" != "1" ] && [ "$a_ae" = "1" ]; then
-    echo "结果: 总开关已重新打开"
-  else
-    echo "结果: 状态正常，无需修复"
+  total=$(printf '%s\n' "$tgt" | grep -c .)
+  echo "守护目标: ${appn} 个应用，${total} 个服务"
+  if acc_is_paused; then
+    echo "结果: 已暂停，未检查或修复；使用 acc_ctl resume 恢复"
+    return 0
   fi
-
-  rj=$(rejected_list | grep -c .)
-  if [ "$rj" -gt 0 ]; then echo "注意: ${rj} 个服务被系统拒绝启用（rejected.txt）"; fi
+  before_raw=$(settings get secure enabled_accessibility_services 2>/dev/null)
+  before_rc=$?
+  before=$(norm_list "$before_raw")
+  b_missing=$(count_missing "$tgt" "$before")
+  b_ae=$(settings get secure accessibility_enabled 2>/dev/null) || b_ae=未知
+  sh "$MODDIR/bin/acc_keeper.sh" --once >/dev/null 2>&1
+  once_rc=$?
+  if [ "$once_rc" -eq 2 ]; then
+    echo "结果: 已暂停，未检查或修复"
+    return 0
+  fi
+  after_raw=$(settings get secure enabled_accessibility_services 2>/dev/null)
+  after_rc=$?
+  after=$(norm_list "$after_raw")
+  a_missing=$(count_missing "$tgt" "$after")
+  a_ae=$(settings get secure accessibility_enabled 2>/dev/null) || a_ae=未知
+  if [ "$start_rc" -ne 0 ] || [ "$once_rc" -ne 0 ] || [ "$before_rc" -ne 0 ] || [ "$after_rc" -ne 0 ] || ! acc_running; then
+    echo "结果: 点检或启动校验失败，无法确认守护状态；请检查日志"
+    return 1
+  fi
+  rj=0
+  for target in $tgt; do is_rejected "$target" && rj=$((rj + 1)); done
+  [ "$rj" -gt 0 ] && echo "注意: ${rj} 个目标曾被系统拒绝（rejected.txt）"
+  if [ "$a_missing" -gt 0 ] || { [ "$total" -gt 0 ] && [ "$a_ae" != 1 ]; }; then
+    echo "结果: 点检失败，仍缺少 ${a_missing} 个目标服务（总开关 $a_ae）"
+    return 1
+  elif [ "$a_missing" -lt "$b_missing" ]; then
+    echo "结果: 已恢复 $((b_missing - a_missing)) 个目标服务"
+  elif [ "$total" -gt 0 ] && [ "$b_ae" != 1 ] && [ "$a_ae" = 1 ]; then
+    echo "结果: 总开关已重新打开"
+  elif [ "$total" -eq 0 ]; then
+    echo "结果: 未选择守护目标"
+  else
+    echo "结果: 目标状态正常，无需修复"
+  fi
   echo "日志: su -c acc_ctl log 20"
+  return 0
 }
 
 # 清空"系统拒绝"名单（应用更新后想重新试一次时用）
@@ -579,15 +679,28 @@ do_reset_rejected() {
 }
 # WebUI 数据：H=元信息 T=守护 C=系统已启用 S=已安装无障碍服务 P=已安装包
 do_dump() {
-  # 一次 app_process 唤醒拿回两个设置值，别分成两次
-  _s=$(settings list secure 2>/dev/null)
-  _ae=$(printf '%s\n' "$_s" | sed -n 's/^accessibility_enabled=//p' | head -n 1)
-  _eas=$(printf '%s\n' "$_s" | sed -n 's/^enabled_accessibility_services=//p' | head -n 1)
-  [ -z "$_ae" ] && _ae=$(settings get secure accessibility_enabled 2>/dev/null)
-  [ -z "$_eas" ] && _eas=$(settings get secure enabled_accessibility_services 2>/dev/null)
+  # 系统读取失败时返回非零；WebUI 显示“状态未知”，而非误判目标缺失。
+  _s=$(settings list secure 2>/dev/null) || _s=""
+  _ae_line=$(printf '%s\n' "$_s" | sed -n '/^accessibility_enabled=/{p;q;}')
+  _eas_line=$(printf '%s\n' "$_s" | sed -n '/^enabled_accessibility_services=/{p;q;}')
+  if [ -n "$_ae_line" ] && [ -n "$_eas_line" ]; then
+    _ae=${_ae_line#*=}; _eas=${_eas_line#*=}
+  else
+    _ae=$(settings get secure accessibility_enabled 2>/dev/null) || { echo "读取无障碍总开关失败" >&2; return 1; }
+    _eas=$(settings get secure enabled_accessibility_services 2>/dev/null) || { echo "读取无障碍服务列表失败" >&2; return 1; }
+  fi
+  case "$_ae" in 0|1|null|NULL|Null) ;; *) echo "无障碍总开关状态无效" >&2; return 1 ;; esac
+  case "$_eas" in
+    ''|null|NULL|Null) ;;
+    *) if ! printf '%s\n' "$_eas" | tr ':' '\n' | while IFS= read -r _ent || [ -n "$_ent" ]; do
+      [ -n "$_ent" ] || continue
+      case "$_ent" in *[!A-Za-z0-9_.$/]*) exit 1 ;; esac
+      norm_one "$_ent" >/dev/null || exit 1
+    done; then echo "无障碍服务列表无效" >&2; return 1; fi ;;
+  esac
 
-  pid=$(cat "$PID_FILE" 2>/dev/null)
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo "H|daemon|1"; else echo "H|daemon|0"; fi
+  refresh_desc
+  if acc_running; then echo "H|daemon|1"; else echo "H|daemon|0"; fi
   echo "H|enabled|$_ae"
   echo "H|paused|$(cat "$PAUSE_FILE" 2>/dev/null || echo 0)"
   _fx=$(cat "$DATA_DIR/fixes.count" 2>/dev/null)
@@ -622,27 +735,50 @@ read_targets_norm() {
   done | sort -u
 }
 
+do_target_locked() {
+  _op=$1; shift
+  case "$_op" in
+    add) do_add "$@" ;;
+    del) do_del "$@" ;;
+    on) do_on "$@" ;;
+    off) do_off "$@" ;;
+    clean) do_clean "$@" ;;
+    *) return 1 ;;
+  esac
+}
+do_target_serial() {
+  mkdir -p "$DATA_DIR" || return 1
+  acc_lock_init || { echo "无法取得目标修改锁"; return 1; }
+  "$ACC_LOCK_TOOL" flock "$DATA_DIR/.work.lock" sh "$MODDIR/bin/acc_ctl" _target_locked "$@"
+}
+
 cmd=$1
 [ $# -gt 0 ] && shift
 case "$cmd" in
   scan)          do_scan ;;
   list|ls)       do_list ;;
-  add)           do_add "$@" ;;
-  del|rm|remove) do_del "$@" ;;
-  on|enable)     do_on "$@" ;;
-  off|disable)   do_off "$@" ;;
-  apply)         sh "$MODDIR/bin/acc_keeper.sh" --once; tail -n 5 "$LOG_FILE" 2>/dev/null | sed 's/^/  /' ;;
+  add)           do_target_serial add "$@" ;;
+  del|rm|remove) do_target_serial del "$@" ;;
+  on|enable)     do_target_serial on "$@" ;;
+  off|disable)   do_target_serial off "$@" ;;
+  apply)         sh "$MODDIR/bin/acc_keeper.sh" --once; _rc=$?; tail -n 5 "$LOG_FILE" 2>/dev/null | sed 's/^/  /'; exit "$_rc" ;;
   status|st)     do_status ;;
   log|logs)      tail -n "${1:-30}" "$LOG_FILE" 2>/dev/null || echo "(暂无日志)" ;;
   pause)         do_pause "$@" ;;
   resume)        do_resume ;;
   interval)      do_interval "$@" ;;
   restart)       do_restart ;;
-  clean)         do_clean ;;
+  clean)         do_target_serial clean ;;
   adopt)         do_adopt ;;
   upgrade)       do_upgrade "$@" ;;
   scan-list)     do_scan_list ;;
   check)         do_check ;;
+  ensure)        do_ensure ;;
+  _target_locked) do_target_locked "$@" ;;
+  _ensure_locked) do_ensure_locked ;;
+  _restart_locked) do_restart_locked ;;
+  _pause_locked) do_pause_locked "$@" ;;
+  _resume_locked) do_resume_locked ;;
   reset-rejected) do_reset_rejected ;;
   packages)      do_packages "$@" ;;
   userpkgs)      do_packages -3 ;;

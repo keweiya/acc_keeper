@@ -160,6 +160,7 @@ html.locked,body.locked{overflow:hidden!important;height:100%}
   border:0;width:100%;text-align:left;color:var(--text);font-family:inherit;cursor:pointer}
 .row+.row{border-top:1px solid var(--divider)}
 .row:active{background:var(--surface-2)}
+.row:disabled{opacity:.5;cursor:default}
 .row .grow{flex:1;min-width:0}
 .row .value{color:var(--muted);font-size:13px;white-space:nowrap}
 .chev{color:var(--secondary);font-size:19px;line-height:1;margin-top:-2px}
@@ -308,7 +309,7 @@ function $(s, r){ return (r || document).querySelector(s); }
    KernelSU / KernelSU Next 的签名是 ksu.exec(cmd, optionsJson, callbackFuncName)，
    第三个参数是注册在 window 上的函数名字符串，不是一个函数对象。 */
 var cbSeq = 0;
-function ksuExec(cmd, opts){
+function ksuExec(cmd, opts, timeoutMs){
   return new Promise(function(resolve){
     if(typeof ksu === "undefined" || !ksu || typeof ksu.exec !== "function"){
       resolve({errno:-99, stdout:"", stderr:"NO_BRIDGE"}); return;
@@ -319,16 +320,17 @@ function ksuExec(cmd, opts){
     function cb(errno, stdout, stderr){
       if(done) return;
       done = true; clearTimeout(timer); cleanup();
-      resolve({errno: errno|0, stdout: stdout||"", stderr: stderr||""});
+      var code = (errno === undefined || errno === null || errno === "") ? NaN : Number(errno);
+      resolve({errno: isFinite(code) ? code : -1, stdout: stdout == null ? "" : String(stdout), stderr: stderr == null ? "" : String(stderr)});
     }
-    var timer = setTimeout(function(){ cb(-98, "", "TIMEOUT"); }, 20000);
+    var timer = setTimeout(function(){ cb(-98, "", "TIMEOUT"); }, timeoutMs || 20000);
     window[name] = function(errno, stdout, stderr){ cb(errno, stdout, stderr); };
     try{
       var ret = ksu.exec(cmd, JSON.stringify(opts || {}), name);
       if(ret && typeof ret.then === "function"){
         ret.then(function(x){
           if(x && typeof x === "object") cb(x.errno, x.stdout, x.stderr);
-          else cb(0, ret == null ? "" : String(ret), "");
+          else cb(0, x == null ? "" : String(x), "");
         }).catch(function(e){ cb(-1, "", String(e)); });
       } else if(typeof ret === "string" && ret && ret !== name){
         cb(0, ret, "");
@@ -336,12 +338,12 @@ function ksuExec(cmd, opts){
     }catch(e){ cb(-1, "", String(e)); }
   });
 }
-async function sh(args){
-  var r = await ksuExec("/system/bin/sh " + ACC + " " + args);
-  if(r.errno === -99 || r.errno === -98) return r;
-  if(r.errno !== 0 && !r.stdout){
-    var r2 = await ksuExec("/system/bin/sh " + ACC_ALT + " " + args);
-    if(r2.errno === 0 || r2.stdout) return r2;
+async function sh(args, timeoutMs){
+  var r = await ksuExec("/system/bin/sh " + ACC + " " + args, null, timeoutMs);
+  /* 只在主脚本明确不存在时尝试更新目录；不能因普通失败重复执行有副作用的命令。 */
+  if(r.errno !== 0 && !r.stdout && r.stderr.indexOf(ACC) >= 0 &&
+     /no such file|not found|cannot open|can't open|inaccessible/i.test(r.stderr)){
+    return await ksuExec("/system/bin/sh " + ACC_ALT + " " + args, null, timeoutMs);
   }
   return r;
 }
@@ -372,35 +374,42 @@ try{
 
 /* ---------------- 状态 ---------------- */
 var ST = {meta:{}, targets:new Set(), current:new Set(), services:[], blocked:new Set(), pkgs:[], userpkgs:[], label:new Map(), sys:new Map()};
-var UI = {onlyGuarded:false, showAll:false, q:"", busy:false, first:true};
+var UI = {onlyGuarded:false, showAll:false, q:"", busy:false, first:true, fresh:false, loading:true};
 
 function jparse(x){
   if(typeof x !== "string") return x;
   try { return JSON.parse(x); } catch(e){ return null; }
 }
+/* 与 acc_ctl norm_one 一致；不能让缩写类名导致目标和系统列表错配。 */
+function normComp(value){
+  var c = String(value || "").trim(), i = c.indexOf("/");
+  if(i <= 0 || i === c.length - 1 || c.indexOf("/", i + 1) >= 0) return "";
+  var pkg = c.slice(0, i), cls = c.slice(i + 1);
+  if(cls.charAt(0) === ".") cls = pkg + cls;
+  else if(cls.indexOf(".") < 0) cls = pkg + "." + cls;
+  return pkg + "/" + cls;
+}
 function parseDump(txt){
   ST = {meta:{}, targets:new Set(), current:new Set(), services:[], blocked:new Set(), pkgs:[], userpkgs: ST.userpkgs || [], label:new Map(), sys:new Map()};
-  (txt||"").split("\n").forEach(function(l){
+  (txt||"").split("\n").forEach(function(line){
+    var l = line.replace(/\r$/, "");
     if(!l) return;
     var i = l.indexOf("|");
     if(i < 0) return;
-    var k = l.slice(0,i), v = l.slice(i+1);
+    var k = l.slice(0,i), v = l.slice(i+1), c;
     if(k === "H"){
       var j = v.indexOf("|");
       if(j > 0) ST.meta[v.slice(0,j)] = v.slice(j+1);
-    } else if(k === "T"){ ST.targets.add(v); }
-    else if(k === "C"){ ST.current.add(v); }
+    } else if(k === "T"){ c = normComp(v); if(c) ST.targets.add(c); }
+    else if(k === "C"){ c = normComp(v); if(c) ST.current.add(c); }
     else if(k === "S"){
       var bar = v.lastIndexOf("|");
-      if(bar > 0){
-        var comp = v.slice(0, bar);
-        ST.services.push(comp);
-        if(v.slice(bar + 1) === "0") ST.blocked.add(comp);
-      } else {
-        ST.services.push(v);
+      c = normComp(bar > 0 ? v.slice(0, bar) : v);
+      if(c){
+        if(ST.services.indexOf(c) < 0) ST.services.push(c);
+        if(bar > 0 && v.slice(bar + 1) === "0") ST.blocked.add(c);
       }
-    }
-    else if(k === "P"){ ST.pkgs.push(v); }
+    } else if(k === "P" && v){ ST.pkgs.push(v.trim()); }
   });
 }
 /* KernelSU 管理器是在 WebUI 打开后【异步】才抓应用列表的，
@@ -473,7 +482,7 @@ async function ensurePkgs(){
 
 /* ---------------- 数据整理 ---------------- */
 function ensure(map, p){
-  if(!map.has(p)) map.set(p, {pkg:p, comps:[], guarded:false, live:false, name:p, system:false});
+  if(!map.has(p)) map.set(p, {pkg:p, comps:[], targets:[], guarded:false, live:false, name:p, system:false});
   return map.get(p);
 }
 function isUserApp(p){
@@ -495,6 +504,7 @@ function buildRows(){
     if(!isUserApp(p)) return;
     var a = ensure(map, p);
     a.guarded = true;
+    a.targets.push(c);
     if(a.comps.indexOf(c) < 0) a.comps.push(c);
   });
   if(UI.showAll || UI.q) ST.pkgs.forEach(function(p){ if(isUserApp(p)) ensure(map, p); });
@@ -509,8 +519,9 @@ function buildRows(){
     a.name = ST.label.get(a.pkg) || a.pkg;
     a.system = ST.sys.get(a.pkg) === true;
     a.live = a.comps.some(function(c){ return ST.current.has(c); });
+    a.targetEnabled = a.targets.filter(function(c){ return ST.current.has(c); }).length;
     a.blocked = a.comps.length > 0 && a.comps.every(function(c){ return ST.blocked.has(c); });
-    a.on = a.guarded || a.live;
+    a.on = a.guarded;
     out.push(a);
   });
 
@@ -541,9 +552,17 @@ function shortName(name, pkg){
   return m ? m[0].toUpperCase() : "?";
 }
 function statusText(a){
-  if(a.guarded && a.live) return {t:"守护中 · 服务运行中", c:"is-live"};
-  if(a.guarded) return {t:"守护中 · 等待恢复", c:"is-wait"};
-  if(a.live) return {t:"系统已启用 · 未纳入守护", c:"is-live"};
+  if(!UI.fresh) return {t: UI.loading ? "正在检查状态…" : "状态未知，请刷新", c:"is-idle"};
+  if(a.guarded){
+    var prefix = ST.meta.daemon === "1" ? (isPaused() ? "已选守护 · 已暂停" : "守护中") :
+      (ST.meta.daemon === "0" ? (isPaused() ? "已选守护 · 进程未运行、已暂停" : "已选守护 · 进程未运行") : "已选守护 · 进程状态未知");
+    var total = a.targets.length, n = a.targetEnabled;
+    var suffix = n === total ? "目标均已系统启用" : n ? ("目标 " + n + "/" + total + " 已系统启用") : "目标未系统启用";
+    if(ST.meta.enabled === "0") suffix += " · 系统总开关已关闭";
+    else if(ST.meta.enabled !== "1") suffix += " · 系统总开关未知";
+    return {t:prefix + " · " + suffix, c:n === total && ST.meta.enabled === "1" && ST.meta.daemon === "1" && !isPaused() ? "is-live" : "is-wait"};
+  }
+  if(a.live) return {t:"系统已启用 · 未选择守护", c:"is-live"};
   if(a.blocked) return {t:"系统不接受此服务（已记录）", c:"is-idle"};
   if(a.comps.length) return {t:"已声明无障碍服务，未开启", c:"is-idle"};
   return {t:"没有无障碍服务", c:"is-idle"};
@@ -572,27 +591,33 @@ function renderStatus(){
   var parts = [];
   /* 注意别用 className 覆盖，会把 js-dot 这个钩子一起抹掉 */
   dot.classList.remove("is-ok", "is-warn");
-  if(isPaused()){
+  if(!UI.fresh || (ST.meta.daemon !== "0" && ST.meta.daemon !== "1")){
+    name.textContent = UI.loading ? "检查中…" : "状态未知";
+    parts.push(UI.fresh ? "守护进程状态未知" : "显示的列表可能是缓存");
+  } else if(ST.meta.daemon === "0"){
+    name.textContent = "未运行";
+    if(isPaused()) parts.push("已暂停 · 还剩 " + pausedLeftMin() + " 分钟");
+    if(total) parts.push(total + " 个应用");
+    parts.push(n ? "已选守护 " + n + " 个" : "未配置应用");
+    parts.push("点立即检查可尝试启动");
+  } else if(isPaused()){
     dot.classList.add("is-warn");
     name.textContent = "已暂停";
-    parts.push("还剩 " + pausedLeftMin() + " 分钟");
+    parts.push("进程运行中 · 还剩 " + pausedLeftMin() + " 分钟");
     if(total) parts.push(total + " 个应用");
-    if(n) parts.push("守护 " + n + " 个");
-  } else if(ST.meta.daemon === "1"){
+    if(n) parts.push("已选守护 " + n + " 个");
+  } else {
     dot.classList.add("is-ok");
     name.textContent = "运行中";
     if(total) parts.push(total + " 个应用");
     parts.push(n ? "守护 " + n + " 个" : "还没选应用");
     parts.push("每 " + poll + " 秒巡检");
-  } else {
-    name.textContent = "未运行";
-    if(total) parts.push(total + " 个应用");
-    parts.push(n ? "守护 " + n + " 个 · 重启设备可恢复" : "未配置应用");
   }
   meta.textContent = parts.join(" · ");
   /* 设置面板里的动态值 */
   $(".js-interval-val").textContent = poll + " 秒";
-  $(".js-pause-label").textContent = isPaused() ? "恢复守护" : "暂停守护 30 分钟";
+  $(".js-pause-label").textContent = UI.fresh ? (isPaused() ? "恢复守护" : "暂停守护 30 分钟") : "暂停状态未知";
+  $(".js-menu-pause").disabled = !UI.fresh;
   $(".js-ver").textContent = ST.meta.ver || "";
   $(".js-tgl-guarded").classList.toggle("on", UI.onlyGuarded);
   $(".js-tgl-all").classList.toggle("on", UI.showAll);
@@ -683,9 +708,9 @@ function renderList(){
         '<div class="package-name">' + esc(a.pkg) + (a.system ? " · 系统" : "") + '</div>' +
         '<div class="app-status ' + st.c + '">' + esc(st.t) + '</div>' +
       '</div>' +
-      '<div class="switch' + (a.on ? " is-on" : "") + (a.comps.length && !a.blocked ? "" : " is-disabled") +
-        '" role="switch" aria-checked="' + (a.on ? "true" : "false") + '" data-pkg="' + esc(a.pkg) +
-        '" data-has="' + (a.comps.length && !a.blocked ? "1" : "0") + '"><span class="switch-thumb"></span></div>' +
+      '<div class="switch' + (a.on ? " is-on" : "") + (UI.fresh && (a.guarded || (a.comps.length && !a.blocked)) ? "" : " is-disabled") +
+        '" role="switch" aria-label="选择守护 ' + esc(a.name) + '" aria-checked="' + (a.on ? "true" : "false") + '" data-pkg="' + esc(a.pkg) +
+        '" data-has="' + (UI.fresh && (a.guarded || (a.comps.length && !a.blocked)) ? "1" : "0") + '"><span class="switch-thumb"></span></div>' +
     '</div>';
   });
   list.innerHTML = html;
@@ -777,7 +802,12 @@ function pkgHash(list){
   return h + "_" + list.length;
 }
 
+var loadGeneration = 0;
 async function load(force){
+  var generation = ++loadGeneration;
+  UI.fresh = false;
+  UI.loading = true;
+  render();
   busyStart(UI.hasCache ? "" : "正在加载…");
 
   /* 包列表优先用 ksu（毫秒级），顺便判断"无障碍服务清单有没有变" */
@@ -786,33 +816,39 @@ async function load(force){
   var hash = pkgHash(keepPkgs);
   var scan = null;
   try{ scan = JSON.parse(localStorage.getItem(SCAN_KEY) || "null"); }catch(e){}
-  var reuse = !force && !!(scan && scan.h === hash && scan.s &&
+  var reuse = !force && !!(scan && scan.h === hash && Array.isArray(scan.s) &&
+               scan.s.every(function(x){ return Array.isArray(x) && !!normComp(x[0]); }) &&
                (Date.now() - (scan.t || 0) < 86400000));
 
   var r = await sh("dump" + (reuse ? " --fast" : ""));
-  if(r.errno === -99 || r.errno === -98){
+  if(generation !== loadGeneration) return false;
+  if(r.errno !== 0 || !/^H\|daemon\|[01]\r?$/m.test(r.stdout) || !/^H\|enabled\|/m.test(r.stdout)){
+    UI.fresh = false;
+    UI.loading = false;
     busyEnd();
-    $(".js-status-text").textContent = "";
-    $(".js-empty").classList.remove("hidden");
-    $(".js-empty").innerHTML = r.errno === -99
-      ? "请在 KernelSU 管理器中打开本模块的 WebUI<br>（模块卡片上的「打开」按钮）"
-      : "命令超时，守护脚本没有响应。<br>在终端里跑 <b>su -c acc_ctl status</b> 看看，<br>或确认模块已启用并重启过。";
-    return;
-  }
-  if(!r.stdout){
-    busyEnd();
-    $(".js-status-text").textContent = "读取失败：" + (r.stderr || ("errno " + r.errno));
-    return;
+    render();
+    var err = r.errno === -99 ? "请在 KernelSU 管理器中打开本模块的 WebUI" :
+      r.errno === -98 ? "状态读取超时，请重试" :
+      r.errno !== 0 ? "读取失败：" + (r.stderr || r.stdout || ("errno " + r.errno)).trim() : "状态数据不完整，请检查后端协议";
+    notice(err, "warn");
+    if(!UI.hasCache && !ST.services.length && !ST.targets.size){
+      $(".js-empty").classList.remove("hidden");
+      $(".js-empty").textContent = err;
+    }
+    return false;
   }
 
   lastDump = r.stdout;
   parseDump(r.stdout);
+  UI.fresh = true;
+  UI.loading = false;
+  UI.hasCache = true;
   ST.pkgs = keepPkgs;
 
   if(reuse && scan && scan.s){
     /* 服务清单没变：直接用上次的，少跑一次 query-services */
-    ST.services = scan.s.map(function(x){ return x[0]; });
-    ST.blocked = new Set(scan.s.filter(function(x){ return x[1] === 0; }).map(function(x){ return x[0]; }));
+    ST.services = Array.from(new Set(scan.s.map(function(x){ return normComp(x[0]); })));
+    ST.blocked = new Set(scan.s.filter(function(x){ return x[1] === 0; }).map(function(x){ return normComp(x[0]); }));
     lastDump = rebuildDumpFromState();
   } else if(ST.services.length){
     try{
@@ -829,94 +865,42 @@ async function load(force){
   render();
   busyEnd();
 
-  /* 后台补两件事：已启用的服务默认纳入守护、补齐应用名 */
+  /* 只补应用名；系统已启用并不等于用户选择守护，绝不自动 adopt。 */
   (async function(){
-    var needAdopt = false;
-    ST.current.forEach(function(c){
-      if(ST.services.indexOf(c) >= 0 && !ST.targets.has(c)) needAdopt = true;
-    });
-    if(needAdopt){
-      await sh("adopt");
-      var r2 = await sh("dump");
-      if(r2 && r2.stdout){ var _kp = ST.pkgs.slice(); parseDump(r2.stdout); ST.pkgs = _kp; render(); }
-    }
-    var before = ST.label.size;
+    var snapshot = ST, before = ST.label.size;
     await enrich();
+    if(ST !== snapshot) return;
     saveCache();
     if(ST.label.size !== before) render();
   })();
+  return true;
 }
 
-/* 只更新一行 + 重排，不重新拉数据（避免整屏闪烁、图标重载） */
-function updateCard(pkg, on){
-  var card = document.querySelector('.app-card[data-pkg="' + pkg + '"]');
-  if(!card) return;
-  var sw = card.querySelector(".switch");
-  sw.classList.toggle("is-on", on);
-  sw.setAttribute("aria-checked", on ? "true" : "false");
-  sw.classList.add("is-pop");
-  setTimeout(function(){ sw.classList.remove("is-pop"); }, 500);
-  var st = card.querySelector(".app-status");
-  if(st){
-    if(on){ st.textContent = "守护中 · 服务运行中"; st.className = "app-status is-live"; }
-    else if(card.querySelector(".package-name")){ st.textContent = "已声明无障碍服务，未开启"; st.className = "app-status is-idle"; }
-  }
-}
-
-function reorderCards(){
-  var list = $(".js-list");
-  var cards = Array.prototype.slice.call(list.querySelectorAll(".app-card"));
-  var order = buildRows().map(function(r){ return r.pkg; });
-  if(order.length !== cards.length){ renderList(); return; }   /* 集合变了才整屏重画 */
-  var map = {};
-  cards.forEach(function(c){ map[c.getAttribute("data-pkg")] = c; });
-  var firstTop = {};
-  cards.forEach(function(c){ firstTop[c.getAttribute("data-pkg")] = c.getBoundingClientRect().top; });
-  var frag = document.createDocumentFragment();
-  order.forEach(function(p){ if(map[p]) frag.appendChild(map[p]); });
-  list.appendChild(frag);
-  cards.forEach(function(c){
-    var p = c.getAttribute("data-pkg");
-    var dy = firstTop[p] - c.getBoundingClientRect().top;
-    if(!dy) return;
-    c.style.transition = "none";
-    c.style.transform = "translateY(" + dy + "px)";
-    requestAnimationFrame(function(){
-      c.style.transition = "transform .3s cubic-bezier(.2,.8,.2,1)";
-      c.style.transform = "";
-    });
-  });
-}
-
+function shellQuote(value){ return "'" + String(value).replace(/'/g, "'\\''") + "'"; }
 async function toggle(pkg, on, el){
-  if(UI.busy || el.classList.contains("is-busy")) return;
+  if(UI.busy || !UI.fresh || el.classList.contains("is-busy")) return;
   UI.busy = true;
-  el.classList.add("is-busy");      /* 先转圈，成功才翻 */
-
-  var comps = ST.services.filter(function(c){ return c.split("/")[0] === pkg; });
-  var cmd = on ? ("on " + pkg + (comps.length ? " " + comps.join(" ") : "")) : ("off " + pkg);
-  var r = await sh(cmd);
-
-  el.classList.remove("is-busy");
-  UI.busy = false;
-
-  if(r.errno !== 0){
-    el.classList.add("is-fail");
-    setTimeout(function(){ el.classList.remove("is-fail"); }, 460);
-    notice((r.stdout || r.stderr || "操作失败").trim().split("\n")[0], "warn");
-    return;
+  UI.fresh = false; UI.loading = true; ++loadGeneration; renderStatus();
+  Array.prototype.forEach.call(document.querySelectorAll(".app-status"), function(st){ st.textContent = "正在检查状态…"; st.className = "app-status is-idle"; });
+  el.classList.add("is-busy");
+  try{
+    var comps = ST.services.filter(function(c){ return c.split("/")[0] === pkg; });
+    var cmd = on ? ("on " + shellQuote(pkg) + (comps.length ? " " + comps.map(shellQuote).join(" ") : "")) : ("off " + shellQuote(pkg));
+    var r = await sh(cmd);
+    var loaded = await load(true);
+    if(r.errno !== 0){
+      notice((r.stdout || r.stderr || "操作失败").trim().split("\n")[0], "warn");
+    } else if(!loaded){
+      notice("操作已执行，但状态回读失败，请刷新确认", "warn");
+    } else {
+      var row = buildRows().filter(function(a){ return a.pkg === pkg; })[0];
+      if((on && (!row || !row.guarded)) || (!on && row && row.guarded)) notice("操作后守护选择未生效，请查看日志", "warn");
+      else if(on && row && (row.targetEnabled !== row.targets.length || ST.meta.enabled !== "1")) notice("已选择守护，部分目标尚未系统启用", "warn");
+    }
+  } finally {
+    el.classList.remove("is-busy");
+    UI.busy = false;
   }
-
-  /* 本地更新：写集合、改这一行、重排 —— 不重新 dump，所以不会闪 */
-  comps.forEach(function(c){
-    if(on){ ST.targets.add(c); ST.current.add(c); }
-    else { ST.targets.delete(c); ST.current.delete(c); }
-  });
-  updateCard(pkg, on);
-  renderStatus();
-  reorderCards();
-  lastDump = rebuildDumpFromState();
-  saveCache();
 }
 
 /* 把内存里的状态拼回 dump 文本，供缓存使用（不用再跑一次 shell） */
@@ -974,10 +958,16 @@ $(".js-show-all").addEventListener("click", async function(){
 });
 
 $(".js-menu-pause").addEventListener("click", async function(){
+  if(UI.busy || !UI.fresh) return;
+  UI.busy = true;
   closeMenu();
-  var r = isPaused() ? await sh("resume") : await sh("pause 30");
-  if(r.errno !== 0) notice((r.stdout || r.stderr || "操作失败").trim(), "warn");
-  await load();
+  var cmd = isPaused() ? "resume" : "pause 30";
+  UI.fresh = false; UI.loading = true; ++loadGeneration; render();
+  try{
+    var r = await sh(cmd);
+    await load();
+    if(r.errno !== 0) notice((r.stdout || r.stderr || "操作失败").trim(), "warn");
+  } finally { UI.busy = false; }
 });
 
 $(".js-menu-log").addEventListener("click", async function(){
@@ -1000,10 +990,10 @@ $(".js-menu-about").addEventListener("click", async function(){
   }catch(e){}
   var name = (info && info.name) || "无障碍守护";
   var ver = (info && info.version) || ST.meta.ver || "";
-  var state = (info && info.description) || ST.meta.desc || "";
+  var state = $(".js-state").textContent + ($(".js-meta").textContent ? " · " + $(".js-meta").textContent : "");
   $(".js-sheet-body").textContent =
     name + " " + ver + "\n\n" +
-    (state ? "当前状态\n" + state + "\n\n" : "") +
+    "当前状态\n" + state + "\n\n" +
     "开机自动启用并持续守护指定应用的无障碍服务。\n" +
     "系统或安全中心把它关掉后自动恢复，并记录每次被关的时间与组件。\n\n" +
     "守护列表: /data/adb/acc_keeper/targets.txt\n" +
@@ -1040,6 +1030,7 @@ $(".js-interval-sheet").addEventListener("click", function(e){
   if(!e.target.closest(".sheet-inner")){ this.classList.add("hidden"); lockScroll(false); }
 });
 $(".js-interval-save").addEventListener("click", async function(){
+  if(UI.busy) return;
   var f = parseInt($(".js-in-fast").value, 10);
   var s = parseInt($(".js-in-slow").value, 10);
   var m = $(".js-interval-msg");
@@ -1048,17 +1039,21 @@ $(".js-interval-save").addEventListener("click", async function(){
     m.className = "form-msg js-interval-msg is-warn";
     return;
   }
+  UI.busy = true;
+  UI.fresh = false; UI.loading = true; ++loadGeneration; render();
   m.textContent = "保存中…";
   m.className = "form-msg js-interval-msg";
-  var r = await sh("interval " + f + " " + s);
-  if(r.errno === 0){
-    m.textContent = (r.stdout || "已保存").trim().split("\n").join(" · ");
-    m.className = "form-msg js-interval-msg is-ok";
-    await load();
-  } else {
-    m.textContent = (r.stderr || r.stdout || "保存失败").trim();
-    m.className = "form-msg js-interval-msg is-warn";
-  }
+  try{
+    var r = await sh("interval " + f + " " + s);
+    var loaded = await load();
+    if(r.errno === 0 && loaded){
+      m.textContent = (r.stdout || "已保存").trim().split("\n").join(" · ");
+      m.className = "form-msg js-interval-msg is-ok";
+    } else {
+      m.textContent = r.errno === 0 ? "已保存，但状态回读失败" : (r.stderr || r.stdout || "保存失败").trim();
+      m.className = "form-msg js-interval-msg is-warn";
+    }
+  } finally { UI.busy = false; }
 });
 
 function openSheet(title){
@@ -1078,15 +1073,37 @@ $(".js-sheet").addEventListener("click", function(e){
 /* ---------------- 立即检查 ---------------- */
 $(".js-fix").addEventListener("click", async function(){
   var fab = this;
-  if(UI.busy) return;
+  if(UI.busy || !$(".js-menu-sheet").classList.contains("hidden") ||
+     !$(".js-interval-sheet").classList.contains("hidden") || !$(".js-sheet").classList.contains("hidden")) return;
   UI.busy = true;
+  UI.fresh = false;
+  UI.loading = true;
+  ++loadGeneration;   /* 失效任何此前发起的异步刷新 */
+  render();
   fab.classList.add("is-busy");
-  busyStart("正在检查并修复…");
-  var r = await sh("apply");
-  await load(true);      /* 手动检查：强制重新扫描服务 */
-  fab.classList.remove("is-busy");
-  UI.busy = false;
-  if(r.errno !== 0) notice((r.stderr || r.stdout || "修复失败").trim(), "warn");
+  busyStart("正在点检所选目标…");
+  try{
+    /* check 负责按需拉起守护并核验目标，不在 UI 猜测启动或修复成功。 */
+    var r = await sh("check", 120000);
+    var loaded = await load(true);
+    var text = (r.stdout || "").trim();
+    if(r.stderr) text += (text ? "\n" : "") + r.stderr.trim();
+    if(!text) text = r.errno === 0 ? "未返回点检结果" : (r.errno === -98 ? "点检超时，结果未知" : "点检失败，未返回详情");
+    if(r.errno !== 0) text = "点检未成功（错误码 " + r.errno + "）\n" + text;
+    if(!loaded) text += "\n\n状态回读失败，请刷新确认。";
+    else {
+      text += "\n\n当前：" + $(".js-state").textContent + " · " + $(".js-meta").textContent;
+    }
+    openSheet("点检结果");
+    $(".js-sheet-body").textContent = text;
+  } catch(e){
+    UI.fresh = false; UI.loading = false; render(); busyEnd();
+    openSheet("点检结果");
+    $(".js-sheet-body").textContent = "点检异常，结果未知：" + String(e);
+  } finally {
+    fab.classList.remove("is-busy");
+    UI.busy = false;
+  }
 });
 
 /* ---------------- 下拉刷新 ---------------- */
@@ -1120,7 +1137,7 @@ $(".js-fix").addEventListener("click", async function(){
 })();
 
 applyTheme();
-if(loadCache()){ UI.first = false; UI.hasCache = true; render(); }
+if(loadCache()){ UI.first = false; UI.hasCache = true; }
 load();
 })();
 </script>

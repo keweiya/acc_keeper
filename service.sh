@@ -2,6 +2,8 @@
 # 开机后（late_start service 阶段）拉起守护进程
 MODDIR=${0%/*}
 [ -d "$MODDIR" ] || MODDIR=/data/adb/modules/acc_keeper
+export ACC_KEEPER_DATA_DIR=/data/adb/acc_keeper
+export ACC_KEEPER_MODDIR="$MODDIR"
 
 # 用子 shell 后台跑，避免阻塞 KernelSU 的启动流程
 (
@@ -11,5 +13,6 @@ MODDIR=${0%/*}
     i=$((i + 1))
   done
   sleep 2
-  exec sh "$MODDIR/bin/acc_keeper.sh"
+  export ACC_KEEPER_MODDIR="$MODDIR"
+  exec sh "$MODDIR/bin/acc_ctl" ensure
 ) >/dev/null 2>&1 &
