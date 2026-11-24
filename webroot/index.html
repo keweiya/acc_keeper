@@ -146,7 +146,7 @@ html.locked,body.locked{overflow:hidden!important;height:100%}
 /* ---------- 底部面板 ---------- */
 /* 不用 backdrop-filter：全屏遮罩每帧对背后几百张卡片重算模糊，是掉帧的头号原因，
    换成纯半透明底色，视觉几乎一样 */
-.sheet{position:fixed;inset:0;background:rgba(0,0,0,.42);display:flex;align-items:flex-end;z-index:60}
+.sheet{position:fixed;inset:0;background:rgba(0,0,0,.42);display:flex;align-items:flex-end;z-index:60;overscroll-behavior:contain}
 .sheet-inner{width:100%;max-height:88%;background:var(--bg);border-radius:20px 20px 0 0;display:flex;flex-direction:column;
   box-shadow:var(--shadow-card);animation:sheet-in .3s cubic-bezier(.2,.8,.2,1);overflow:hidden}
 @keyframes sheet-in{0%{transform:translateY(24px);opacity:.4}to{transform:translateY(0);opacity:1}}
@@ -839,19 +839,54 @@ function busyEnd(){ $(".js-spin").classList.add("hidden"); $(".js-status").class
    面板开着时不重排背后那张长列表，数据照收，关掉面板再一次性画。 */
 var savedScrollY = 0;
 function lockScroll(on){
+  var was = !!UI.locked;
+  on = !!on;
+  if(on && !was) savedScrollY = window.scrollY || window.pageYOffset || 0;
   var m = on ? "hidden" : "";
-  if(on) savedScrollY = window.scrollY || window.pageYOffset || 0;
-  UI.locked = !!on;
-  UI.deferRender = !!on;
+  UI.locked = on;
+  UI.deferRender = on;
   document.documentElement.style.overflow = m;
   document.body.style.overflow = m;
-  document.documentElement.classList.toggle("locked", !!on);
-  document.body.classList.toggle("locked", !!on);
-  if(!on){
+  document.documentElement.classList.toggle("locked", on);
+  document.body.classList.toggle("locked", on);
+  if(!on && was){
     if(UI.pendingRender){ UI.pendingRender = false; render(); }
     if(savedScrollY) requestAnimationFrame(function(){ window.scrollTo(0, savedScrollY); });
   }
 }
+
+/* ---------------- 面板栈 ----------------
+   同一时刻只有最上层那个面板接手手势和滚动，别的层不响应、也不往列表透传。
+   从「设置与操作」换到子面板（日志 / 轮询间隔）走替换而不是"先关再开"，
+   整个切换过程不解锁，所以中间不会闪回主页。 */
+var PANES = [];
+function topPane(){ return PANES.length ? PANES[PANES.length - 1] : null; }
+function showPane(el){
+  var cur = topPane();
+  if(cur && cur !== el){
+    var i = PANES.indexOf(cur);
+    if(i >= 0) PANES.splice(i, 1);
+    cur.classList.add("hidden");
+  }
+  if(PANES.indexOf(el) < 0) PANES.push(el);
+  el.classList.remove("hidden");
+  lockScroll(true);
+}
+function closePane(el){
+  var i = PANES.indexOf(el);
+  if(i >= 0) PANES.splice(i, 1);
+  el.classList.add("hidden");
+  if(!PANES.length) lockScroll(false);
+}
+
+/* 锁定期间，落在最上层面板之外的触摸一律截住：
+   不滚背后的列表、不点到卡片、也拉不起下拉刷新。 */
+document.addEventListener("touchstart", function(e){
+  if(!UI.locked) return;
+  var top = topPane();
+  if(!top || top.contains(e.target)) return;
+  e.stopPropagation();
+}, true);
 
 /* 面板打开时，遮罩上的滑动不允许带动背后的列表；点遮罩关闭 */
 document.addEventListener("touchmove", function(e){
@@ -1027,8 +1062,8 @@ $(".js-search").addEventListener("input", async function(e){
 });
 
 /* ---------------- 设置面板 ---------------- */
-function openMenu(){ $(".js-menu-sheet").classList.remove("hidden"); lockScroll(true); }
-function closeMenu(){ $(".js-menu-sheet").classList.add("hidden"); lockScroll(false); }
+function openMenu(){ showPane($(".js-menu-sheet")); }
+function closeMenu(){ closePane($(".js-menu-sheet")); }
 $(".js-more").addEventListener("click", openMenu);
 $(".js-menu-close").addEventListener("click", closeMenu);
 $(".js-menu-sheet").addEventListener("click", function(e){ if(!e.target.closest(".sheet-inner")) closeMenu(); });
@@ -1066,14 +1101,12 @@ $(".js-menu-pause").addEventListener("click", async function(){
 });
 
 $(".js-menu-log").addEventListener("click", async function(){
-  closeMenu();
   openSheet("最近日志");
   var r = await sh("log 200");
   $(".js-sheet-body").textContent = r.stdout || "(暂无记录 · 只在服务被关闭或出错时写入)";
 });
 
 $(".js-menu-about").addEventListener("click", async function(){
-  closeMenu();
   openSheet("关于");
   var info = null;
   try{
@@ -1110,21 +1143,18 @@ Array.prototype.forEach.call(document.querySelectorAll(".js-seg button"), functi
 
 /* 轮询间隔 */
 $(".js-menu-interval").addEventListener("click", function(){
-  closeMenu();
   $(".js-in-fast").value = ST.meta.poll_fast || "3";
   $(".js-in-slow").value = ST.meta.poll_slow || "60";
   var m = $(".js-interval-msg");
   m.textContent = "";
   m.className = "form-msg js-interval-msg";
-  $(".js-interval-sheet").classList.remove("hidden");
-  lockScroll(true);
+  showPane($(".js-interval-sheet"));
 });
 $(".js-interval-close").addEventListener("click", function(){
-  $(".js-interval-sheet").classList.add("hidden");
-  lockScroll(false);
+  closePane($(".js-interval-sheet"));
 });
 $(".js-interval-sheet").addEventListener("click", function(e){
-  if(!e.target.closest(".sheet-inner")){ this.classList.add("hidden"); lockScroll(false); }
+  if(!e.target.closest(".sheet-inner")) closePane($(".js-interval-sheet"));
 });
 $(".js-interval-save").addEventListener("click", async function(){
   if(UI.busy) return;
@@ -1156,15 +1186,13 @@ $(".js-interval-save").addEventListener("click", async function(){
 function openSheet(title){
   $(".js-sheet-title").textContent = title;
   $(".js-sheet-body").textContent = "加载中…";
-  $(".js-sheet").classList.remove("hidden");
-  lockScroll(true);
+  showPane($(".js-sheet"));
 }
 $(".js-sheet-close").addEventListener("click", function(){
-  $(".js-sheet").classList.add("hidden");
-  lockScroll(false);
+  closePane($(".js-sheet"));
 });
 $(".js-sheet").addEventListener("click", function(e){
-  if(!e.target.closest(".sheet-inner")){ this.classList.add("hidden"); lockScroll(false); }
+  if(!e.target.closest(".sheet-inner")) closePane($(".js-sheet"));
 });
 
 /* ---------------- 立即检查 ---------------- */
