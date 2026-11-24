@@ -144,9 +144,11 @@ html.locked,body.locked{overflow:hidden!important;height:100%}
 .sheet-inner,.sheet-body{overscroll-behavior:contain}
 
 /* ---------- 底部面板 ---------- */
-.sheet{position:fixed;inset:0;background:#0006;display:flex;align-items:flex-end;z-index:60;backdrop-filter:blur(2px)}
+/* 不用 backdrop-filter：全屏遮罩每帧对背后几百张卡片重算模糊，是掉帧的头号原因，
+   换成纯半透明底色，视觉几乎一样 */
+.sheet{position:fixed;inset:0;background:rgba(0,0,0,.42);display:flex;align-items:flex-end;z-index:60}
 .sheet-inner{width:100%;max-height:88%;background:var(--bg);border-radius:20px 20px 0 0;display:flex;flex-direction:column;
-  box-shadow:var(--shadow-card);animation:sheet-in .3s cubic-bezier(.2,.8,.2,1)}
+  box-shadow:var(--shadow-card);animation:sheet-in .3s cubic-bezier(.2,.8,.2,1);overflow:hidden}
 @keyframes sheet-in{0%{transform:translateY(24px);opacity:.4}to{transform:translateY(0);opacity:1}}
 .sheet-grab{width:36px;height:5px;border-radius:999px;background:var(--divider);margin:8px auto 0;flex:none}
 .sheet-head{display:flex;align-items:center;padding:10px 20px 12px;font-weight:700;font-size:17px}
@@ -194,6 +196,7 @@ html.locked,body.locked{overflow:hidden!important;height:100%}
 .form-msg.is-warn{color:var(--warn)}
 
 .sheet pre{margin:0;padding:4px 20px calc(24px + env(safe-area-inset-bottom));overflow:auto;
+  overscroll-behavior:contain;will-change:scroll-position;-webkit-overflow-scrolling:touch;
   font:12px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);white-space:pre-wrap;word-break:break-all}
 </style>
 </head>
@@ -390,7 +393,10 @@ function normComp(value){
   return pkg + "/" + cls;
 }
 function parseDump(txt){
-  ST = {meta:{}, targets:new Set(), current:new Set(), services:[], blocked:new Set(), pkgs:[], userpkgs: ST.userpkgs || [], label:new Map(), sys:new Map()};
+  /* label / sys 是应用名缓存，跟 dump 内容无关：清掉的话每次刷新会先按包名排一遍、
+     再等 enrich 拿回名字按中文名排一遍，列表会当场抖两下。 */
+  ST = {meta:{}, targets:new Set(), current:new Set(), services:[], blocked:new Set(), pkgs:[], userpkgs: ST.userpkgs || [],
+        label: ST.label || new Map(), sys: ST.sys || new Map()};
   (txt||"").split("\n").forEach(function(line){
     var l = line.replace(/\r$/, "");
     if(!l) return;
@@ -436,14 +442,26 @@ function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
 async function enrich(list, retry){
   /* 只查"要显示的"那些包的标签，几百个包全查会很卡 */
   var want = (list && list.length) ? list : neededPkgs();
+  /* 已经有名字的不用再问一遍 */
+  want = want.filter(function(p){ return !ST.label.has(p); });
   if(!want.length) return;
 
   if(hasInfoApi()){
-    var got = fetchInfos(want);
+    /* getPackagesInfo 是同步 JS 桥调用，一次丢几百个包会把主线程按住好几帧：
+       分批取，批间让出一次事件循环，滑动时才不卡。 */
+    var CHUNK = 40, got = 0, i, j;
+    if(want.length > CHUNK){
+      for(i = 0; i < want.length; i += CHUNK){
+        got += fetchInfos(want.slice(i, i + CHUNK));
+        await sleep(0);
+      }
+    } else {
+      got = fetchInfos(want);
+    }
     if(got === 0 && retry !== false){
-      for(var i = 1; i <= 5 && got === 0; i++){
-        await sleep(300 * i);          /* 0.3s 0.6s 0.9s 1.2s */
-        got = fetchInfos(want);
+      for(j = 1; j <= 5 && got === 0; j++){
+        await sleep(300 * j);          /* 0.3s 0.6s 0.9s 1.2s */
+        got = fetchInfos(want.slice(0, CHUNK));
       }
     }
     if(got > 0) return;
@@ -583,17 +601,26 @@ function guardedCount(){
 }
 
 /* 顶部状态栏：只放"现在是什么状态"，不放统计结果 */
+/* 上一次画出来的状态结论：刷新期间先留着它，别把整行抖成“检查中” */
+var LAST_STATUS = null;
 function renderStatus(){
   var dot = $(".js-dot"), name = $(".js-state"), meta = $(".js-meta");
   var n = guardedCount();
   var total = UI.rowCount || 0;
   var poll = ST.meta.poll_slow || "60";
   var parts = [];
+  var solid = UI.fresh && (ST.meta.daemon === "0" || ST.meta.daemon === "1");
   /* 注意别用 className 覆盖，会把 js-dot 这个钩子一起抹掉 */
   dot.classList.remove("is-ok", "is-warn");
-  if(!UI.fresh || (ST.meta.daemon !== "0" && ST.meta.daemon !== "1")){
-    name.textContent = UI.loading ? "检查中…" : "状态未知";
-    parts.push(UI.fresh ? "守护进程状态未知" : "显示的列表可能是缓存");
+  if(!solid){
+    if(UI.loading && LAST_STATUS){
+      /* 已经有一屏可信数据：保留上一条结论，只在右边说明正在刷新 */
+      name.textContent = LAST_STATUS.t;
+      parts.push("正在刷新…");
+    } else {
+      name.textContent = UI.loading ? "检查中…" : "状态未知";
+      parts.push(UI.fresh ? "守护进程状态未知" : "显示的列表可能是缓存");
+    }
   } else if(ST.meta.daemon === "0"){
     name.textContent = "未运行";
     if(isPaused()) parts.push("已暂停 · 还剩 " + pausedLeftMin() + " 分钟");
@@ -614,6 +641,7 @@ function renderStatus(){
     parts.push("每 " + poll + " 秒巡检");
   }
   meta.textContent = parts.join(" · ");
+  if(solid) LAST_STATUS = {t: name.textContent};
   /* 设置面板里的动态值 */
   $(".js-interval-val").textContent = poll + " 秒";
   $(".js-pause-label").textContent = UI.fresh ? (isPaused() ? "恢复守护" : "暂停守护 30 分钟") : "暂停状态未知";
@@ -674,22 +702,73 @@ function attachIcons(scope){
   });
 }
 
+var ROW_EL = new Map();        /* pkg -> 卡片节点：同一批应用就别重建 DOM */
+
+/* 就地更新一张卡片：不换节点，不重排图标，不重跑进入动画 */
+function applyRow(card, a){
+  var st = statusText(a);
+  var stEl = card.querySelector(".app-status");
+  if(stEl.textContent !== st.t) stEl.textContent = st.t;
+  var stCls = "app-status " + st.c;
+  if(stEl.className !== stCls) stEl.className = stCls;
+  var nameEl = card.querySelector(".app-name");
+  if(nameEl.textContent !== a.name) nameEl.textContent = a.name;
+  var pkgEl = card.querySelector(".package-name");
+  var pkgTxt = a.pkg + (a.system ? " · 系统" : "");
+  if(pkgEl.textContent !== pkgTxt) pkgEl.textContent = pkgTxt;
+  var has = (UI.fresh && (a.guarded || (a.comps.length && !a.blocked))) ? "1" : "0";
+  var sw = card.querySelector(".switch");
+  if(sw.getAttribute("data-has") !== has) sw.setAttribute("data-has", has);
+  var swCls = "switch" + (a.on ? " is-on" : "") + (has === "1" ? "" : " is-disabled");
+  if(sw.className !== swCls) sw.className = swCls;
+  var aria = a.on ? "true" : "false";
+  if(sw.getAttribute("aria-checked") !== aria) sw.setAttribute("aria-checked", aria);
+}
+
 function renderList(){
+  if(UI.deferRender){ UI.pendingRender = true; return; }
   var rows = buildRows();
   var list = $(".js-list"), empty = $(".js-empty"), status = $(".js-status-text");
+  UI.rowCount = rows.length;
 
   if(!rows.length){
-    list.innerHTML = "";
+    if(list.innerHTML) list.innerHTML = "";
     list.classList.remove("is-ready");
     empty.classList.remove("hidden");
     if(UI.q) empty.innerHTML = "没有匹配「" + esc(UI.q) + "」的应用";
     else if(UI.onlyGuarded) empty.innerHTML = "还没有守护任何应用<br>在「设置与操作」里关掉“仅看已守护”，挑一个打开";
     else empty.innerHTML = "没有可显示的应用";
-    UI.rowCount = 0;
+    ROW_EL.clear();
     status.textContent = "";
     return;
   }
   empty.classList.add("hidden");
+
+  /* 同一批应用就别重建。先看 DOM 顺序和这次排序是否完全一致：
+     一致（稳态）就只比较文本、该改的才改，零结构操作；
+     不一致（拿到应用名后排序变过一次）才用 insertBefore 归位，节点和图标都复用。 */
+  var sameSet = ROW_EL.size === rows.length;
+  if(sameSet){
+    for(var s = 0; s < rows.length; s++){ if(!ROW_EL.has(rows[s].pkg)){ sameSet = false; break; } }
+  }
+  if(sameSet){
+    var orderOk = true, probe = list.firstElementChild;
+    for(var d = 0; d < rows.length; d++){
+      if(!probe || probe.getAttribute("data-pkg") !== rows[d].pkg){ orderOk = false; break; }
+      probe = probe.nextElementSibling;
+    }
+    if(!orderOk){
+      var cursor = list.firstElementChild;
+      rows.forEach(function(a){
+        var el = ROW_EL.get(a.pkg);
+        if(el !== cursor){ list.insertBefore(el, cursor || null); }
+        else { cursor = cursor.nextElementSibling; }
+      });
+    }
+    rows.forEach(function(a){ applyRow(ROW_EL.get(a.pkg), a); });
+    status.textContent = "";
+    return;
+  }
 
   var animate = UI.first;
   var html = "";
@@ -714,9 +793,12 @@ function renderList(){
     '</div>';
   });
   list.innerHTML = html;
+  ROW_EL.clear();
+  Array.prototype.forEach.call(list.querySelectorAll(".app-card"), function(c){
+    ROW_EL.set(c.getAttribute("data-pkg"), c);
+  });
   attachIcons(list);
 
-  UI.rowCount = rows.length;
   status.textContent = "";
 
   UI.first = false;
@@ -730,7 +812,10 @@ function renderList(){
   }
 }
 
-function render(){ renderList(); renderStatus(); }
+function render(){
+  if(UI.deferRender){ UI.pendingRender = true; return; }
+  renderList(); renderStatus();
+}
 
 /* ---------------- 交互 ---------------- */
 var noticeTimer = null;
@@ -749,13 +834,23 @@ function busyStart(txt){
   if(txt) $(".js-status-text").textContent = txt;
 }
 function busyEnd(){ $(".js-spin").classList.add("hidden"); $(".js-status").classList.add("idle"); }
-/* 面板打开时锁住背后的列表，不然在面板上滑会把列表滚了 */
+/* 面板打开时锁住背后的列表，不然在面板上滑会把列表滚了。
+   UI.locked 同时是下拉刷新的门闸：锁定时背后根本没得滚，任何下拉都算误触。
+   面板开着时不重排背后那张长列表，数据照收，关掉面板再一次性画。 */
+var savedScrollY = 0;
 function lockScroll(on){
   var m = on ? "hidden" : "";
+  if(on) savedScrollY = window.scrollY || window.pageYOffset || 0;
+  UI.locked = !!on;
+  UI.deferRender = !!on;
   document.documentElement.style.overflow = m;
   document.body.style.overflow = m;
   document.documentElement.classList.toggle("locked", !!on);
   document.body.classList.toggle("locked", !!on);
+  if(!on){
+    if(UI.pendingRender){ UI.pendingRender = false; render(); }
+    if(savedScrollY) requestAnimationFrame(function(){ window.scrollTo(0, savedScrollY); });
+  }
 }
 
 /* 面板打开时，遮罩上的滑动不允许带动背后的列表；点遮罩关闭 */
@@ -1108,16 +1203,35 @@ $(".js-fix").addEventListener("click", async function(){
   }
 });
 
-/* ---------------- 下拉刷新 ---------------- */
+/* ---------------- 下拉刷新 ----------------
+   只在"主列表停在顶部、且没有任何面板打开"时接管下拉手势。
+   原来的判断只看 window.scrollY：面板一开 body 被锁成 overflow:hidden，scrollY 永远是 0，
+   于是在日志面板里往下滑会顺手把下拉刷新拉起来 —— 每帧改 .ptr 高度让整页重排（卡），
+   松手还跑一次完整 dump（2.5 秒）并把标题刷成“检查中”。 */
 (function(){
   var ptr = $(".js-ptr"), spin = $(".js-ptr-spinner");
   var startY = 0, dist = 0, pulling = false;
+  function inSheet(t){
+    return !!(t && t.closest && t.closest(".sheet, .sheet-inner, pre, .form, input, textarea, button"));
+  }
+  function canPull(){
+    if(UI.busy || UI.locked) return false;
+    if(document.body.classList.contains("locked")) return false;
+    if((window.scrollY || window.pageYOffset || 0) > 0) return false;
+    return true;
+  }
+  function reset(){
+    pulling = false;
+    ptr.classList.remove("on");
+    ptr.style.height = "0px";
+  }
   document.addEventListener("touchstart", function(e){
-    if(UI.busy || window.scrollY > 0) return;
+    if(!canPull() || inSheet(e.target)){ reset(); return; }
     startY = e.touches[0].clientY; pulling = true; dist = 0;
   }, {passive:true});
   document.addEventListener("touchmove", function(e){
     if(!pulling) return;
+    if(!canPull()){ reset(); return; }   /* 中途弹面板或开始刷新就放手 */
     dist = Math.max(0, e.touches[0].clientY - startY);
     if(dist > 0){
       ptr.classList.add("on");
@@ -1126,11 +1240,12 @@ $(".js-fix").addEventListener("click", async function(){
   }, {passive:true});
   document.addEventListener("touchend", async function(){
     if(!pulling) return;
+    var d = dist;
     pulling = false;
-    if(dist > 72){
+    if(d > 72 && canPull()){
       spin.classList.add("active");
       ptr.style.height = "42px";
-      await load(true);
+      await load();                    /* 带缓存的 --fast，0.8 秒级，不再是 2.5 秒的完整 dump */
       spin.classList.remove("active");
     }
     ptr.classList.remove("on");
